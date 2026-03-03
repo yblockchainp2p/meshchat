@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>MeshChat v20 — Crypto + E2E + DHT Mesh</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- SETUP -->
+<div class="ov" id="ov">
+  <div class="cd">
+    <div class="cd-t">MeshChat</div>
+    <div class="cd-s">Crypto Identity + E2E Encrypted DM + DHT Mesh</div>
+    <div class="fd">
+      <label>Username</label>
+      <input id="nIn" placeholder="Enter your name..." maxlength="24" autocomplete="off">
+    </div>
+    <div class="setup-id" id="setupId"></div>
+    <div class="ib">
+      🔑 ECDSA identity — every message is signed<br>
+      🔒 ECDH + AES-GCM — end-to-end encrypted DMs<br>
+      💾 IndexedDB — messages persist across refresh<br>
+      🌐 Kademlia DHT + Gossip — scalable mesh<br>
+      📡 Channels — type #name to create/join
+    </div>
+    <button class="jb" id="jBtn">Join Network &rarr;</button>
+    <div style="text-align:center;margin-top:10px">
+      <span id="resetBtn" style="font-family:var(--mono);font-size:9px;color:var(--t3);cursor:pointer;text-decoration:underline;">Reset all data</span>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST NOTIFICATIONS -->
+<div id="toastBox"></div>
+
+<!-- PROFILE MODAL -->
+<div class="profile-modal" id="profileModal">
+  <div class="profile-card" id="profileCard"></div>
+</div>
+
+<!-- APP -->
+<div class="app">
+  <div class="topbar">
+    <div class="topbar-l">
+      <span class="brand">MeshChat</span>
+      <span class="tag tag-off" id="statusTag">offline</span>
+      <span class="id-badge" id="idBadge" title="Your identity">—</span>
+    </div>
+    <div class="topbar-r">
+      <div class="ts"><span class="dot dot-g"></span>P2P:<b id="sP">0</b></div>
+      <div class="ts"><span class="dot dot-c"></span>DHT:<b id="sD">0</b></div>
+      <div class="ts"><span class="dot dot-v"></span>Msgs:<b id="sM">0</b></div>
+      <button class="mob-toggle" id="mobToggle" title="Menu">&#9776;</button>
+    </div>
+  </div>
+
+  <aside class="sidebar">
+    <div class="stabs">
+      <div class="stab on" data-t="channels">Channels</div>
+      <div class="stab" data-t="peers">Peers</div>
+      <div class="stab" data-t="saved">Saved</div>
+      <div class="stab" data-t="dht">DHT</div>
+      <div class="stab" data-t="net">Map</div>
+      <div class="stab" data-t="admin" style="display:none">Admin</div>
+    </div>
+    <div class="spanel on" id="pnChannels">
+      <div id="chList"></div>
+      <div class="ch-new-wrap">
+        <input class="ch-new-input" id="chNewIn" placeholder="New channel name..." maxlength="30">
+      </div>
+    </div>
+    <div class="spanel" id="pnPeers"><div id="pList"></div></div>
+    <div class="spanel" id="pnSaved"><div id="savedList"></div></div>
+    <div class="spanel" id="pnDht"><div id="dhtV"></div></div>
+    <div class="spanel" id="pnNet">
+      <div class="nviz"><canvas id="nCvs"></canvas></div>
+      <div class="nst" id="nSt"></div>
+    </div>
+    <div class="spanel" id="pnAdmin"><div id="adminPanel"></div></div>
+  </aside>
+
+  <main class="main">
+    <div class="chhead">
+      <div style="min-width:0;flex:1;">
+        <div class="chn"><span>#</span> <span id="curChName">general</span> <span class="ch-active-users" id="activeUsers"></span></div>
+        <div class="ch-topic" id="chTopic" title="Click to set topic"></div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+        <input id="searchIn" class="search-input" placeholder="🔍 Search..." style="display:none;">
+        <span id="searchToggle" style="cursor:pointer;font-size:12px;color:var(--t3);" title="Search messages">🔍</span>
+        <span id="globalSearchToggle" style="cursor:pointer;font-size:12px;color:var(--t3);" title="Search all channels">🌐</span>
+        <div class="e2e-tag" id="e2eTag" style="display:none"><span class="dot dot-g"></span>E2E encrypted</div>
+        <div class="gtag" id="gossipTag"><span class="dot dot-v"></span>gossip · fanout <b id="fV">6</b></div>
+      </div>
+    </div>
+    <div class="msgs" id="msgs"></div>
+    <!-- Emoji Picker -->
+    <div class="emoji-picker" id="emojiPicker" style="display:none;"></div>
+    <!-- Poll Creation -->
+    <div class="poll-create" id="pollCreate" style="display:none;">
+      <div class="poll-create-head">📊 Create Poll <span id="pollCreateClose" style="cursor:pointer;float:right;">✕</span></div>
+      <input class="poll-create-input" id="pollQ" placeholder="Ask a question..." maxlength="200">
+      <div id="pollOpts"></div>
+      <div style="display:flex;gap:6px;margin-top:6px;">
+        <button class="admin-btn" id="pollAddOpt" style="flex:1;">+ Add option</button>
+        <button class="sbtn" id="pollSend" style="width:auto;padding:0 14px;font-size:11px;">Send Poll</button>
+      </div>
+    </div>
+    <div class="ibar">
+      <div class="reply-bar" id="replyBar" style="display:none;"></div>
+      <div class="irow">
+        <input type="file" id="fileIn" style="display:none" accept="image/*,video/*,.pdf,.zip,.doc,.docx,.txt">
+        <div style="position:relative;">
+          <button class="sbtn" id="attachBtn" title="Attach" style="background:var(--bg2);color:var(--t2);border:1px solid var(--brd);">+</button>
+          <div class="attach-menu" id="attachMenu" style="display:none;">
+            <div class="attach-item" data-act="file">📁 File</div>
+            <div class="attach-item" data-act="poll">📊 Poll</div>
+            <div class="attach-item" data-act="emoji">😀 Emoji</div>
+          </div>
+        </div>
+        <div class="iwrap"><textarea id="mIn" placeholder="Type a message... (#channel @user)" rows="1"></textarea></div>
+        <button class="sbtn" id="sBtn">&uarr;</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="core.js"></script>
+<script src="node.js"></script>
+<script src="ui.js"></script>
+</body>
+</html>
