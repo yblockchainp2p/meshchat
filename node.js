@@ -22,6 +22,14 @@ class Node {
     this._lastMsgTime = new Map(); // senderId -> timestamp (anti-flood)
     this.mutedChannels = new Set(); // muted channel names (no notifications)
     this.pendingAdminQueue = []; // messages waiting for admin to come online
+    // ── Social features (v21) ──
+    this.profile = { bio: '', status: 'online', emoji: '', posts: [] }; // own profile
+    this.peerProfiles = new Map(); // peerId -> { bio, status, emoji, posts }
+    this.stories = new Map(); // oderId -> { text, bgColor, ts, expiresAt }
+    this.typing = new Map(); // channel -> Map(peerId -> { name, ts })
+    this.pins = {}; // channel -> [msgId, ...]
+    this.broadcastChannels = new Set(); // channels in broadcast mode
+    this.readReceipts = new Map(); // msgId -> { delivered: bool, read: bool }
   }
 
   async init(name) {
@@ -58,8 +66,22 @@ class Node {
     if (Array.isArray(muted)) for (const m of muted) this.mutedChannels.add(m);
     const paq = await DB.getKey('pending:adminQueue');
     if (Array.isArray(paq)) this.pendingAdminQueue = paq;
-    // Prune expired items (>24h)
     this._pruneAdminQueue();
+
+    // Load social profile
+    const prof = await DB.getKey('profile');
+    if (prof && typeof prof === 'object') Object.assign(this.profile, prof);
+    const pins = await DB.getKey('pins');
+    if (pins && typeof pins === 'object') this.pins = pins;
+    const bc = await DB.getKey('broadcastChannels');
+    if (Array.isArray(bc)) for (const c of bc) this.broadcastChannels.add(c);
+    const savedStories = await DB.getKey('stories');
+    if (Array.isArray(savedStories)) {
+      const now = Date.now();
+      for (const s of savedStories) {
+        if (s.expiresAt > now) this.stories.set(s.senderId + '-' + s.ts, s);
+      }
+    }
 
     // Don't auto-assign admin here — wait for bootstrap peer list
     this.mod.checkAdmin(this.id);
@@ -521,11 +543,14 @@ class Node {
         admins: [...this.mod.admins],
         mods: [...this.mod.mods],
         ads: this.mod.getAdsPacket(),
-        // Sync media approval state so new peers don't show stale "pending"
         mediaApprovals: [...this.mod.approvedMedia].slice(-200),
         mediaRejections: [...this.mod.rejectedMedia].slice(-200),
-        // Sync slow mode settings
         slowMode: this._slowMode || {},
+        // Social data (v21)
+        profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, posts: (this.profile.posts || []).slice(-200) },
+        pins: this.pins,
+        broadcastChannels: [...this.broadcastChannels],
+        stories: this._getActiveStories(),
       });
 
       // Send history for sync
@@ -579,6 +604,14 @@ class Node {
       case 'edit-msg': this.onEditMsg(d, from); break;
       case 'slow-mode': if (d.channel && d.seconds !== undefined) { if (!this._slowMode) this._slowMode = {}; this._slowMode[d.channel] = d.seconds; DB.setKey('slowMode', this._slowMode); } break;
       case 'poll-vote': this.onPollVote(d, from); break;
+      // Social features (v21)
+      case 'typing': this.onTyping(d, from); break;
+      case 'msg-ack': this.onMsgAck(d, from); break;
+      case 'msg-read': this.onMsgRead(d, from); break;
+      case 'story': this.onStory(d, from); break;
+      case 'profile-update': this.onProfileUpdate(d, from); break;
+      case 'pin': this.onPin(d, from); break;
+      case 'social-post': this.onSocialPost(d, from); break;
     }
   }
 
@@ -647,8 +680,30 @@ class Node {
       DB.setKey('slowMode', this._slowMode);
     }
 
-    // If this peer is admin/mod, flush our pending admin queue to them
+    // Merge social data (v21)
     const senderId = d.nodeId || from;
+    if (d.profile) {
+      this.peerProfiles.set(senderId, { ...d.profile, lastSeen: Date.now() });
+    }
+    if (d.pins && typeof d.pins === 'object') {
+      for (const [ch, pns] of Object.entries(d.pins)) {
+        if (Array.isArray(pns)) this.pins[ch] = pns.slice(0, 3);
+      }
+      DB.setKey('pins', this.pins);
+    }
+    if (Array.isArray(d.broadcastChannels)) {
+      for (const c of d.broadcastChannels) this.broadcastChannels.add(c);
+      DB.setKey('broadcastChannels', [...this.broadcastChannels]);
+    }
+    if (Array.isArray(d.stories)) {
+      for (const s of d.stories) {
+        if (s.senderId && s.ts && s.expiresAt > Date.now()) {
+          this.stories.set(s.senderId + '-' + s.ts, s);
+        }
+      }
+    }
+
+    // If this peer is admin/mod, flush our pending admin queue to them
     if (this.mod.admins.has(senderId) || this.mod.mods.has(senderId)) {
       this._flushToAdmin(from);
     }
@@ -876,6 +931,9 @@ class Node {
         const ch = d.channel || this.chMgr.dmChannel(this.id, d.senderId);
         this.chMgr.joined.add(ch);
         this.store.add({ ...d, text, _verified: true });
+
+        // Send delivery acknowledgment
+        this.sendAck(d.msgId, from);
 
         // Save sender name for offline display
         if (d.sender && d.senderId) {
@@ -1335,4 +1393,263 @@ class Node {
   snap() { const n = []; for (const b of this.rt.bkts) for (const x of b) n.push({ id: x.id, name: x.name }); return n.slice(0, 50); }
   sendTo(pid, d) { const p = this.peers.get(pid); if (p?.ch?.readyState === 'open') try { p.ch.send(JSON.stringify(d)); } catch (e) { console.error('Send:', e); } }
   sig(to, s) { if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s })); }
+
+  // ═══════════════════════════════════════
+  // SOCIAL FEATURES (v21)
+  // ═══════════════════════════════════════
+
+  // ── Typing indicator ──
+  sendTyping(channel) {
+    if (!this._lastTypingSent || Date.now() - this._lastTypingSent > 2000) {
+      this._lastTypingSent = Date.now();
+      for (const [pid] of this.peers) {
+        this.sendTo(pid, { type: 'typing', channel, senderId: this.id, senderName: this.name });
+      }
+    }
+  }
+
+  onTyping(d, from) {
+    if (!d.channel || !d.senderName) return;
+    if (!this.typing.has(d.channel)) this.typing.set(d.channel, new Map());
+    this.typing.get(d.channel).set(d.senderId || from, { name: d.senderName, ts: Date.now() });
+    if (typeof updateTypingUI === 'function') updateTypingUI();
+  }
+
+  getTypingUsers(channel) {
+    const map = this.typing.get(channel);
+    if (!map) return [];
+    const now = Date.now();
+    const active = [];
+    for (const [pid, info] of map) {
+      if (now - info.ts < 3500 && pid !== this.id) active.push(info.name);
+      else map.delete(pid);
+    }
+    return active;
+  }
+
+  // ── Read receipts (DM only) ──
+  sendAck(msgId, from) {
+    this.sendTo(from, { type: 'msg-ack', msgId });
+  }
+
+  sendReadReceipt(channel) {
+    if (!this.chMgr.isDM(channel)) return;
+    const msgs = this.store.getChannel(channel);
+    for (const m of msgs) {
+      if (m.senderId !== this.id && !m._read) {
+        m._read = true;
+        // Find who sent this DM and send read receipt
+        for (const [pid] of this.peers) {
+          if (pid === m.senderId || m.senderId?.startsWith(pid?.slice(0, 8))) {
+            this.sendTo(pid, { type: 'msg-read', msgId: m.msgId });
+          }
+        }
+      }
+    }
+  }
+
+  onMsgAck(d, from) {
+    const r = this.readReceipts.get(d.msgId) || {};
+    r.delivered = true;
+    this.readReceipts.set(d.msgId, r);
+    scheduleRender();
+  }
+
+  onMsgRead(d, from) {
+    const r = this.readReceipts.get(d.msgId) || {};
+    r.delivered = true;
+    r.read = true;
+    this.readReceipts.set(d.msgId, r);
+    scheduleRender();
+  }
+
+  // ── Profile ──
+  updateProfile(data) {
+    if (data.bio !== undefined) this.profile.bio = data.bio.slice(0, 150);
+    if (data.status !== undefined) this.profile.status = data.status;
+    if (data.emoji !== undefined) this.profile.emoji = data.emoji;
+    if (data.avatar !== undefined) this.profile.avatar = data.avatar;
+    DB.setKey('profile', this.profile);
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'profile-update', senderId: this.id, senderName: this.name, profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar } });
+    }
+  }
+
+  onProfileUpdate(d, from) {
+    if (d.profile && d.senderId) {
+      const existing = this.peerProfiles.get(d.senderId) || {};
+      this.peerProfiles.set(d.senderId, { ...existing, ...d.profile, lastSeen: Date.now() });
+      // Forward to other peers
+      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, d); }
+    }
+    ui();
+  }
+
+  getProfile(peerId) {
+    if (peerId === this.id) return { ...this.profile, name: this.name, id: this.id, online: true, lastSeen: Date.now() };
+    const p = this.peerProfiles.get(peerId) || {};
+    const peer = this.peers.get(peerId);
+    return { bio: p.bio || '', status: p.status || 'offline', emoji: p.emoji || '', avatar: p.avatar || '', posts: p.posts || [], name: peer?.info?.name || p.name || peerId.slice(0, 8), id: peerId, online: !!peer, lastSeen: peer?.seen || p.lastSeen || 0 };
+  }
+
+  // ── Social posts (profile wall) ──
+  sendSocialPost(text, imageDataUrl) {
+    if (!text?.trim() && !imageDataUrl) return;
+    const postId = `post-${this.id.slice(0,8)}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+    const post = { id: postId, senderId: this.id, senderName: this.name, text: (text || '').trim().slice(0, 500), ts: Date.now(), likes: [] };
+    // Attach image as thumbnail (max 100KB base64 for P2P gossip)
+    if (imageDataUrl) post.image = imageDataUrl;
+    this.profile.posts.push(post);
+    if (this.profile.posts.length > 200) this.profile.posts = this.profile.posts.slice(-200);
+    DB.setKey('profile', this.profile);
+    // Broadcast (image included — compressed thumbnail)
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'social-post', post, hops: 0 });
+    }
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  onSocialPost(d, from) {
+    if (!d.post?.id || !d.post.senderId) return;
+    const p = this.peerProfiles.get(d.post.senderId) || { posts: [] };
+    if (!p.posts) p.posts = [];
+    if (p.posts.some(x => x.id === d.post.id)) return; // dedup
+    p.posts.push(d.post);
+    if (p.posts.length > 200) p.posts = p.posts.slice(-200);
+    p.name = d.post.senderName;
+    this.peerProfiles.set(d.post.senderId, p);
+    // Gossip forward
+    if ((d.hops || 0) < 3) {
+      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, { ...d, hops: (d.hops || 0) + 1 }); }
+    }
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  likeSocialPost(postId, postOwnerId) {
+    // Find the post
+    const posts = postOwnerId === this.id ? this.profile.posts : (this.peerProfiles.get(postOwnerId)?.posts || []);
+    const post = posts.find(p => p.id === postId);
+    if (!post) return;
+    const idx = post.likes.indexOf(this.id);
+    if (idx >= 0) post.likes.splice(idx, 1); else post.likes.push(this.id);
+    if (postOwnerId === this.id) DB.setKey('profile', this.profile);
+    // Broadcast like
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'social-post-like', postId, postOwnerId, likerId: this.id, toggle: idx < 0 });
+    }
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  // ── Stories ──
+  sendStory(text, bgColor, imageDataUrl) {
+    if (!text?.trim() && !imageDataUrl) return;
+    const story = { senderId: this.id, senderName: this.name, senderEmoji: this.profile.emoji, text: (text || '').trim().slice(0, 280), bgColor: bgColor || '#22d3ee', ts: Date.now(), expiresAt: Date.now() + 24 * 3600 * 1000 };
+    if (imageDataUrl) story.image = imageDataUrl;
+    this.stories.set(this.id + '-' + story.ts, story);
+    this._saveStories();
+    for (const [pid] of this.peers) this.sendTo(pid, { type: 'story', story, hops: 0 });
+  }
+
+  onStory(d, from) {
+    if (!d.story?.senderId || !d.story.ts) return;
+    const key = d.story.senderId + '-' + d.story.ts;
+    if (this.stories.has(key)) return;
+    if (d.story.expiresAt <= Date.now()) return;
+    this.stories.set(key, d.story);
+    this._saveStories();
+    if ((d.hops || 0) < 3) {
+      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, { ...d, hops: (d.hops || 0) + 1 }); }
+    }
+    ui();
+  }
+
+  _getActiveStories() {
+    const now = Date.now();
+    const active = [];
+    let changed = false;
+    for (const [key, s] of this.stories) {
+      if (s.expiresAt > now) active.push(s);
+      else { this.stories.delete(key); changed = true; }
+    }
+    if (changed) this._saveStories();
+    return active;
+  }
+
+  _saveStories() {
+    const arr = [];
+    for (const [, s] of this.stories) arr.push(s);
+    DB.setKey('stories', arr);
+  }
+
+  // ── Pinned messages ──
+  pinMessage(channel, msgId) {
+    if (!this.mod.isAdmin && !this.mod.isMod) return;
+    if (!this.pins[channel]) this.pins[channel] = [];
+    if (this.pins[channel].includes(msgId)) return;
+    this.pins[channel].push(msgId);
+    if (this.pins[channel].length > 3) this.pins[channel].shift();
+    DB.setKey('pins', this.pins);
+    for (const [pid] of this.peers) this.sendTo(pid, { type: 'pin', channel, msgId, action: 'pin' });
+  }
+
+  unpinMessage(channel, msgId) {
+    if (!this.mod.isAdmin && !this.mod.isMod) return;
+    if (this.pins[channel]) {
+      this.pins[channel] = this.pins[channel].filter(id => id !== msgId);
+      DB.setKey('pins', this.pins);
+    }
+    for (const [pid] of this.peers) this.sendTo(pid, { type: 'pin', channel, msgId, action: 'unpin' });
+  }
+
+  onPin(d, from) {
+    if (!d.channel || !d.msgId) return;
+    if (d.action === 'pin') {
+      if (!this.pins[d.channel]) this.pins[d.channel] = [];
+      if (!this.pins[d.channel].includes(d.msgId)) this.pins[d.channel].push(d.msgId);
+      if (this.pins[d.channel].length > 3) this.pins[d.channel].shift();
+    } else if (d.action === 'unpin') {
+      if (this.pins[d.channel]) this.pins[d.channel] = this.pins[d.channel].filter(id => id !== d.msgId);
+    }
+    DB.setKey('pins', this.pins);
+    for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, d); }
+    renderChannel();
+  }
+
+  // ── Broadcast mode ──
+  setBroadcast(channel, enabled) {
+    if (!this.mod.isAdmin) return;
+    if (enabled) this.broadcastChannels.add(channel); else this.broadcastChannels.delete(channel);
+    DB.setKey('broadcastChannels', [...this.broadcastChannels]);
+    for (const [pid] of this.peers) this.sendTo(pid, { type: 'chat', msgId: `bc-${Date.now()}`, sender: this.name, senderId: this.id, text: `📢 ${channel} is now ${enabled ? 'broadcast-only' : 'open to all'}`, ts: Date.now(), hops: 0, channel, lamport: this.clock.tick() });
+  }
+
+  isBroadcast(channel) {
+    return this.broadcastChannels.has(channel);
+  }
+
+  canWrite(channel) {
+    if (!this.isBroadcast(channel)) return true;
+    return this.mod.isAdmin || this.mod.isMod;
+  }
+
+  // ── Badges ──
+  getBadges(peerId) {
+    const badges = [];
+    if (this.mod.admins.has(peerId)) badges.push({ icon: '🛡️', label: 'Admin' });
+    if (this.mod.mods.has(peerId)) badges.push({ icon: '⚔️', label: 'Mod' });
+    // OG: joined within 24h of genesis
+    if (this.genesis.createdAt) {
+      const peer = this.peers.get(peerId);
+      const peerJoin = peer?.seen || this.peerProfiles.get(peerId)?.lastSeen;
+      if (peerJoin && peerJoin - this.genesis.createdAt < 24 * 3600 * 1000) badges.push({ icon: '🏆', label: 'OG' });
+    }
+    // Active: 10+ msgs in last hour
+    const hourAgo = Date.now() - 3600 * 1000;
+    const recentMsgs = this.store.getAll().filter(m => m.senderId === peerId && m.ts > hourAgo);
+    if (recentMsgs.length >= 10) badges.push({ icon: '⚡', label: 'Active' });
+    // New: first seen < 1 hour ago
+    const peer = this.peers.get(peerId);
+    if (peer && Date.now() - (this.trust.firstSeen?.[peerId] || peer.seen) < 3600 * 1000) badges.push({ icon: '🆕', label: 'New' });
+    return badges;
+  }
 }

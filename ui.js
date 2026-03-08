@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v20
+// 8. UI RENDERING — MeshChat v21
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -127,6 +127,8 @@ function parseText(text) {
   out = out.replace(/#([a-zA-Z0-9_-]+)/g, '<span class="hashtag" data-ch="$1">#$1</span>');
   // @user mentions
   out = out.replace(/@([a-zA-Z0-9_#]+)/g, '<span class="mention">@$1</span>');
+  // Plaza link — "check Plaza tab" becomes clickable
+  out = out.replace(/check Plaza tab/g, '<span class="plaza-link" style="color:var(--cyan);cursor:pointer;text-decoration:underline;">open Plaza ↗</span>');
   return out;
 }
 
@@ -175,8 +177,13 @@ function showMentionList(query) {
 }
 
 // Close action popup
+let _popupCooldown = 0;
 function closeActionPopup() {
-  document.querySelectorAll('.msg-action-popup').forEach(p => p.remove());
+  const popups = document.querySelectorAll('.msg-action-popup');
+  if (popups.length) {
+    popups.forEach(p => p.remove());
+    _popupCooldown = Date.now();
+  }
 }
 
 function showMsg({ sender, senderId, text, time, route, hops, self, channel, verified, dm, msgId, fileMeta, replyTo, poll }) {
@@ -274,16 +281,48 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
     }
   }
 
+  const badgesHtml = senderId ? getBadgeHtml(senderId) : '';
+  const receiptHtml = getReceiptHtml(msgId, self, dm);
+
+  // Thread reply count
+  let threadHtml = '';
+  if (msgId && !replyTo) {
+    const threadCount = getThreadReplies(msgId).length;
+    if (threadCount > 0) {
+      threadHtml = `<div class="msg-thread" data-tmid="${esc(msgId)}" style="font-size:10px;color:var(--cyan);cursor:pointer;margin-top:3px;">💬 ${threadCount} ${threadCount === 1 ? 'reply' : 'replies'}</div>`;
+    }
+  }
+
   d.innerHTML = `
-    ${!self ? `<div class="ms" style="color:${c}"><span class="msg-sender-click" data-sid="${esc(senderId)}" style="cursor:pointer;">${esc(sender)}</span>${vBadge}${rl ? ` <span class="mr ${rc}">${rl}</span>` : ''}</div>` : ''}
+    ${!self ? `<div class="ms" style="color:${c}"><span class="msg-sender-click" data-sid="${esc(senderId)}" style="cursor:pointer;">${esc(sender)}</span>${badgesHtml}${vBadge}${rl ? ` <span class="mr ${rc}">${rl}</span>` : ''}</div>` : ''}
     ${replyHtml}
     <div class="mb">${parseText(text)}${editedTag}${fileContent}${pollHtml}${linkPreviewHtml}</div>
     ${reactionsHtml}
-    <div class="mt">${ts}${route !== 'self' ? ` · ${hops}h` : ''}${verified && self ? ' ✓' : ''}</div>`;
+    ${threadHtml}
+    <div class="mt">${ts}${route !== 'self' ? ` · ${hops}h` : ''}${verified && self ? ' ✓' : ''}${receiptHtml}</div>`;
 
   // Hashtag clicks
   d.querySelectorAll('.hashtag').forEach(h => {
     h.addEventListener('click', (e) => { e.preventDefault(); switchChannel(h.dataset.ch); });
+  });
+
+  // Plaza link click -> switch to Plaza tab
+  d.querySelectorAll('.plaza-link').forEach(pl => {
+    pl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Activate Plaza tab
+      document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
+      document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
+      const plazaTab = document.querySelector('.stab[data-t="plaza"]');
+      if (plazaTab) plazaTab.classList.add('on');
+      document.getElementById('pnPlaza')?.classList.add('on');
+      refreshPlaza();
+    });
+  });
+
+  // Thread click -> open thread panel
+  d.querySelectorAll('.msg-thread').forEach(t => {
+    t.addEventListener('click', (e) => { e.stopPropagation(); showThread(t.dataset.tmid); });
   });
 
   // Sender name click -> profile (FIX 4: touch-friendly)
@@ -314,18 +353,43 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
     let touchMoved = false;
     const openActions = (e) => {
       e.preventDefault(); e.stopPropagation();
+      // Cooldown: don't re-open if just closed (prevents touch ghost re-trigger)
+      if (Date.now() - _popupCooldown < 400) return;
       closeActionPopup();
       const popup = document.createElement('div');
       popup.className = 'msg-action-popup';
       let btns = `<div class="action-btn" data-act="reply">↩ Reply</div>`;
       btns += `<div class="action-btn" data-act="react">☺ React</div>`;
+      btns += `<div class="action-btn" data-act="link">🔗 Copy Link</div>`;
       btns += `<div class="action-btn" data-act="forward">↗ Forward</div>`;
       const isBookmarked = N.bookmarks?.some(b => b.msgId === msgId);
       btns += `<div class="action-btn" data-act="bookmark">${isBookmarked ? '★ Unbookmark' : '☆ Bookmark'}</div>`;
       if (self) btns += `<div class="action-btn" data-act="edit">✏ Edit</div>`;
       if (self) btns += `<div class="action-btn" data-act="delete">🗑 Delete</div>`;
       if (!self) btns += `<div class="action-btn" data-act="report">⚑ Report</div>`;
+      if ((N.mod.isAdmin || N.mod.isMod) && !N.chMgr.isDM(channel)) {
+        const isPinned = (N.pins[channel] || []).includes(msgId);
+        btns += `<div class="action-btn" data-act="pin">${isPinned ? '📌 Unpin' : '📌 Pin'}</div>`;
+      }
       popup.innerHTML = btns;
+
+      // Position: if message is in top half of viewport, show popup below; otherwise above
+      d.appendChild(popup);
+      requestAnimationFrame(() => {
+        const msgRect = d.getBoundingClientRect();
+        const viewH = window.innerHeight;
+        const popH = popup.offsetHeight || 150;
+        if (msgRect.top < viewH / 2) {
+          // Message is in top half — show popup below
+          popup.style.top = '100%';
+          popup.style.bottom = 'auto';
+        } else {
+          // Message is in bottom half — show popup above
+          popup.style.bottom = '100%';
+          popup.style.top = 'auto';
+        }
+      });
+
       popup.querySelectorAll('.action-btn').forEach(btn => {
         // Use touchend for mobile, click for desktop
         const handleAction = (ev) => {
@@ -334,6 +398,10 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
           const act = btn.dataset.act;
           if (act === 'reply') {
             setReply(msgId, sender, text);
+          } else if (act === 'link') {
+            closeActionPopup();
+            copyLink(getMessageLink(channel, msgId));
+            return; // Don't call closeActionPopup again below
           } else if (act === 'react') {
             // Show reaction picker inline
             popup.innerHTML = REACTIONS.map(r => `<span class="reaction-pick" data-emoji="${r}">${r}</span>`).join('');
@@ -365,13 +433,16 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
           } else if (act === 'report') {
             const msg = N.store.getChannel(channel).find(m => m.msgId === msgId);
             if (msg) N.reportMessage(msg);
+          } else if (act === 'pin') {
+            const isPinned = (N.pins[channel] || []).includes(msgId);
+            if (isPinned) N.unpinMessage(channel, msgId); else N.pinMessage(channel, msgId);
+            updatePinnedBar();
           }
           closeActionPopup();
         };
         btn.addEventListener('click', handleAction);
         btn.addEventListener('touchend', handleAction, { passive: false });
       });
-      d.appendChild(popup);
     };
     // Mobile: long press; Desktop: right click
     d.addEventListener('contextmenu', openActions);
@@ -419,10 +490,28 @@ function renderChannel() {
   // Update active users count
   const activeEl = document.getElementById('activeUsers');
   if (activeEl && !isDM) {
-    const count = N.peers.size + 1; // +1 for self
+    const count = N.peers.size + 1;
     activeEl.textContent = `(${count} online)`;
   } else if (activeEl) {
     activeEl.textContent = '';
+  }
+
+  // Update pinned bar
+  updatePinnedBar();
+
+  // Send read receipts for DM
+  if (isDM && N.id) N.sendReadReceipt(ch);
+
+  // Broadcast mode — disable input if user can't write
+  const mIn = document.getElementById('mIn');
+  if (mIn) {
+    if (!isDM && N.isBroadcast && N.isBroadcast(ch) && !N.canWrite(ch)) {
+      mIn.disabled = true;
+      mIn.placeholder = '📢 Broadcast channel — only admins can post';
+    } else {
+      mIn.disabled = false;
+      mIn.placeholder = 'Type a message... (#channel @user)';
+    }
   }
 
   const msgs = N.store.getChannel(ch);
@@ -471,7 +560,28 @@ function _doRefreshChannelList() {
   pubChs.sort((a, b) => { if (a.name === 'general') return -1; if (b.name === 'general') return 1; return b.count - a.count; });
   dmChs.sort((a, b) => b.count - a.count);
 
-  let html = '<div class="ch-section">Channels</div>';
+  let html = '';
+
+  // Trending section — most active channels in last hour
+  const hourAgo = Date.now() - 3600 * 1000;
+  const trending = pubChs.map(ch => {
+    const msgs = N.store.getChannel(ch.name);
+    const recentCount = msgs.filter(m => m.ts > hourAgo).length;
+    return { ...ch, recent: recentCount };
+  }).filter(ch => ch.recent > 0).sort((a, b) => b.recent - a.recent).slice(0, 3);
+
+  if (trending.length > 0) {
+    html += '<div class="ch-section">🔥 Trending</div>';
+    for (const ch of trending) {
+      html += `<div class="ch-item trending-item" data-ch="${esc(ch.name)}">
+        <div class="ch-hash" style="color:var(--amber);">🔥</div>
+        <div class="ch-name">${esc(ch.name)}</div>
+        <div class="ch-cnt" style="color:var(--amber);">${ch.recent}/h</div>
+      </div>`;
+    }
+  }
+
+  html += '<div class="ch-section">Channels</div>';
   for (const ch of pubChs) {
     const unread = unreadChannels.has(ch.name) && ch.name !== N.chMgr.current;
     const muted = N.isMuted(ch.name);
@@ -526,7 +636,7 @@ function getDMPeerName(dmChannel) {
   return peerShort;
 }
 
-function switchChannel(ch) {
+function switchChannel(ch, skipHash) {
   if (ch.startsWith('dm:')) {
     N.chMgr.current = ch;
     N.chMgr.joined.add(ch);
@@ -538,6 +648,11 @@ function switchChannel(ch) {
   renderChannel();
   refreshChannelList();
   closeMobileDrawer();
+  // Update URL hash (don't update for DMs — they contain private IDs)
+  if (!skipHash && !ch.startsWith('dm:')) {
+    const hash = ch === 'general' ? '' : ch;
+    history.replaceState(null, '', hash ? `#${hash}` : window.location.pathname);
+  }
 }
 
 // ═══ PEERS ═══
@@ -756,85 +871,7 @@ function stats() {
 
 // ═══ PROFILE CARD (FIX 1: isAdmin ordering + FIX 4: touch) ═══
 function showProfile(peerId) {
-  const peer = N.peers.get(peerId);
-  const peerRt = N.rt?.all?.get(peerId);
-  const name = peer?.info?.name || peerRt?.name || 'unknown';
-  const col = hue(name);
-  // FIX 1: isAdmin must be defined BEFORE trust uses it
-  const isOnline = N.peers.has(peerId);
-  const isAdmin = N.mod.admins.has(peerId);
-  const isMod = N.mod.mods.has(peerId);
-  const trust = isAdmin ? 100 : N.trust.getScore(peerId);
-  const record = N.trust.scores.get(peerId);
-  const role = isAdmin ? '🛡️ Admin' : isMod ? '🔧 Mod' : '';
-  const connTime = record ? Math.round(record.connectionTime / 60000) : 0;
-  const msgsRelayed = record?.msgsRelayed || 0;
-  const firstSeen = record?.firstSeen ? new Date(record.firstSeen).toLocaleDateString() : '—';
-
-  const modal = document.getElementById('profileModal');
-  const card = document.getElementById('profileCard');
-  card.innerHTML = `
-    <div class="pc-header">
-      <div class="pc-avatar" style="background:${col}18;color:${col};border:2px solid ${col}33">${name[0].toUpperCase()}</div>
-      <div>
-        <div class="pc-name">${esc(name)} ${role}</div>
-        <div class="pc-id">${peerId.slice(0, 16)}…</div>
-        <div class="pc-id" style="color:${isOnline ? 'var(--green)' : 'var(--t3)'};">${isOnline ? '● Online' : '○ Offline'}</div>
-      </div>
-    </div>
-    <div class="pc-stats">
-      <div class="pc-stat"><div class="pc-stat-val" style="color:${trust >= 70 ? 'var(--green)' : trust >= 40 ? 'var(--amber)' : 'var(--red)'};">${trust}</div><div class="pc-stat-lbl">Trust</div></div>
-      <div class="pc-stat"><div class="pc-stat-val">${msgsRelayed}</div><div class="pc-stat-lbl">Relayed</div></div>
-      <div class="pc-stat"><div class="pc-stat-val">${connTime}m</div><div class="pc-stat-lbl">Uptime</div></div>
-      <div class="pc-stat"><div class="pc-stat-val">${firstSeen}</div><div class="pc-stat-lbl">First seen</div></div>
-    </div>
-    <div class="pc-actions">
-      ${isOnline ? `<div class="pc-btn" id="pcDm" data-pid="${peerId}">🔒 DM</div>` : ''}
-      <div class="pc-btn" id="pcBlock" data-pid="${peerId}" style="${N.isBlocked(peerId) ? 'color:var(--red);' : ''}">${N.isBlocked(peerId) ? '🔓 Unblock' : '🚫 Block'}</div>
-      <div class="pc-btn" id="pcClose">Close</div>
-    </div>`;
-  modal.classList.add('open');
-
-  // FIX 4: Remove old listeners by cloning, then add new ones
-  const closeHandler = () => modal.classList.remove('open');
-  const dmHandler = () => { N.startDM(peerId); modal.classList.remove('open'); };
-  const blockHandler = () => {
-    if (N.isBlocked(peerId)) N.unblockUser(peerId);
-    else N.blockUser(peerId);
-    modal.classList.remove('open');
-  };
-
-  const pcClose = document.getElementById('pcClose');
-  const pcDm = document.getElementById('pcDm');
-  const pcBlock = document.getElementById('pcBlock');
-
-  if (pcClose) {
-    pcClose.addEventListener('click', closeHandler);
-    pcClose.addEventListener('touchend', (e) => { e.preventDefault(); closeHandler(); }, { passive: false });
-  }
-  if (pcDm) {
-    pcDm.addEventListener('click', dmHandler);
-    pcDm.addEventListener('touchend', (e) => { e.preventDefault(); dmHandler(); }, { passive: false });
-  }
-  if (pcBlock) {
-    pcBlock.addEventListener('click', blockHandler);
-    pcBlock.addEventListener('touchend', (e) => { e.preventDefault(); blockHandler(); }, { passive: false });
-  }
-
-  // Close on backdrop click/touch
-  const backdropHandler = (e) => {
-    if (e.target === modal) {
-      e.preventDefault();
-      modal.classList.remove('open');
-    }
-  };
-  modal.onclick = backdropHandler;
-  modal.ontouchend = (e) => {
-    if (e.target === modal) {
-      e.preventDefault();
-      modal.classList.remove('open');
-    }
-  };
+  showEnhancedProfile(peerId);
 }
 
 function ui() {
@@ -1088,6 +1125,7 @@ const EMOJI_DATA = {
 
 let _emojiCat = 'Smileys';
 let _emojiSearch = '';
+let _emojiTarget = 'mIn'; // which input to insert emoji into
 
 function buildEmojiPicker() {
   const el = document.getElementById('emojiPicker');
@@ -1108,26 +1146,26 @@ function buildEmojiPicker() {
 
   // Category clicks
   el.querySelectorAll('.emoji-cat').forEach(btn => {
-    btn.addEventListener('click', () => { _emojiCat = btn.dataset.cat; _emojiSearch = ''; buildEmojiPicker(); });
+    btn.addEventListener('click', (e) => { e.stopPropagation(); _emojiCat = btn.dataset.cat; _emojiSearch = ''; buildEmojiPicker(); });
   });
   // Emoji clicks — insert into input
   el.querySelectorAll('.emoji-cell').forEach(cell => {
-    cell.addEventListener('click', () => {
-      const mIn = document.getElementById('mIn');
-      mIn.value += cell.textContent;
-      mIn.focus();
+    cell.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const target = document.getElementById(_emojiTarget);
+      if (target) { target.value += cell.textContent; target.focus(); }
     });
   });
   // Search input
   const si = el.querySelector('#emojiSearchIn');
+  si?.addEventListener('click', (e) => e.stopPropagation());
   si?.addEventListener('input', () => {
     const v = si.value;
     if (v) {
-      // Direct character input - just add to textarea
-      const mIn = document.getElementById('mIn');
-      mIn.value += v;
+      const target = document.getElementById(_emojiTarget);
+      if (target) { target.value += v; }
       si.value = '';
-      mIn.focus();
+      if (target) target.focus();
     }
   });
 }
@@ -1256,6 +1294,844 @@ function openGlobalSearch() {
 }
 
 // ═══════════════════════════════════════
+// SHARE POST TO CHANNEL (ephemeral card, 15s)
+// ═══════════════════════════════════════
+function sharePostToChannel(postId, ownerName, preview) {
+  const el = document.getElementById('msgs');
+  const card = document.createElement('div');
+  card.className = 'm m-sys plaza-share-card';
+  card.innerHTML = `
+    <div class="plaza-share-inner">
+      <div class="plaza-share-badge">🏛️ Plaza</div>
+      <div class="plaza-share-text"><b>${esc(ownerName)}</b>: ${esc(preview)}</div>
+      <div class="plaza-share-btn" data-goto="${esc(postId)}">View in Plaza →</div>
+    </div>`;
+  const goToPlaza = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    // Switch to Plaza tab and scroll to post
+    document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
+    document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
+    const plazaTab = document.querySelector('.stab[data-t="plaza"]');
+    if (plazaTab) plazaTab.classList.add('on');
+    document.getElementById('pnPlaza')?.classList.add('on');
+    refreshPlaza();
+    // Open mobile sidebar if needed
+    const sb = document.querySelector('.sidebar');
+    if (sb && window.innerWidth <= 700) {
+      sb.classList.add('mob-open');
+      const toggle = document.getElementById('mobToggle');
+      if (toggle) { toggle.classList.add('active'); toggle.innerHTML = '&times;'; }
+    }
+    setTimeout(() => {
+      const postEl = document.querySelector(`.live-post[data-postid="${CSS.escape(postId)}"]`);
+      if (postEl) {
+        postEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        postEl.style.outline = '2px solid var(--cyan)';
+        setTimeout(() => { postEl.style.outline = ''; }, 2500);
+      }
+    }, 300);
+  };
+  const btn = card.querySelector('.plaza-share-btn');
+  btn.addEventListener('click', goToPlaza);
+  btn.addEventListener('touchend', goToPlaza, { passive: false });
+
+  el.appendChild(card);
+  el.scrollTop = el.scrollHeight;
+
+  // Auto-remove after 15 seconds
+  setTimeout(() => {
+    card.style.transition = 'opacity 0.5s, max-height 0.5s';
+    card.style.opacity = '0';
+    card.style.maxHeight = '0';
+    card.style.overflow = 'hidden';
+    setTimeout(() => card.remove(), 600);
+  }, 15000);
+
+  // Also broadcast to peers so they see the card
+  for (const [pid] of N.peers) {
+    N.sendTo(pid, { type: 'chat', msgId: `share-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, sender: N.name, senderId: N.id, text: `🏛️ shared a Plaza post → tap to view`, ts: Date.now(), hops: 0, channel: N.chMgr.current, lamport: N.clock.tick(), _plazaShare: { postId, ownerName, preview } });
+  }
+  showToastSimple('Shared to channel!');
+}
+
+// ═══════════════════════════════════════
+// CHANNEL STATISTICS
+// ═══════════════════════════════════════
+function showChannelStats() {
+  const ch = N.chMgr.current;
+  if (N.chMgr.isDM(ch)) return;
+  const msgs = N.store.getChannel(ch);
+  if (!msgs.length) { alert('No messages in this channel yet.'); return; }
+
+  // Top senders
+  const senderCounts = {};
+  const hourCounts = new Array(24).fill(0);
+  for (const m of msgs) {
+    senderCounts[m.sender || '?'] = (senderCounts[m.sender || '?'] || 0) + 1;
+    const hour = new Date(m.ts).getHours();
+    hourCounts[hour]++;
+  }
+  const topSenders = Object.entries(senderCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const peakHour = hourCounts.indexOf(Math.max(...hourCounts));
+
+  // Build overlay
+  let ov = document.getElementById('chStatsOverlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'chStatsOverlay';
+    ov.className = 'gsearch-overlay';
+    document.body.appendChild(ov);
+  }
+  ov.style.display = 'flex';
+
+  const maxHourVal = Math.max(...hourCounts, 1);
+  const barsHtml = hourCounts.map((c, i) => {
+    const pct = Math.round(c / maxHourVal * 100);
+    const isP = i === peakHour;
+    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;">
+      <div style="width:100%;background:${isP ? 'var(--cyan)' : 'var(--bg3)'};height:${Math.max(pct, 2)}px;border-radius:2px;transition:height 0.3s;"></div>
+      <span style="font-size:7px;color:var(--t3);">${i}</span>
+    </div>`;
+  }).join('');
+
+  ov.innerHTML = `<div class="gsearch-box" style="max-width:400px;">
+    <div class="gsearch-header" style="flex-direction:column;align-items:flex-start;gap:6px;">
+      <div style="display:flex;width:100%;justify-content:space-between;align-items:center;">
+        <span style="font-size:14px;font-weight:600;">📊 #${esc(ch)} Stats</span>
+        <span class="gsearch-close" id="chStatsClose">✕</span>
+      </div>
+      <div style="font-size:11px;color:var(--t2);">${msgs.length} messages total · Peak hour: ${peakHour}:00</div>
+    </div>
+    <div style="padding:12px;">
+      <div style="font-size:10px;color:var(--t3);text-transform:uppercase;margin-bottom:6px;">Activity by Hour</div>
+      <div style="display:flex;gap:1px;height:60px;align-items:flex-end;margin-bottom:16px;">${barsHtml}</div>
+      <div style="font-size:10px;color:var(--t3);text-transform:uppercase;margin-bottom:6px;">Top Contributors</div>
+      ${topSenders.map(([name, cnt], i) => {
+        const c = hue(name);
+        const pct = Math.round(cnt / msgs.length * 100);
+        return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
+          <span style="font-size:10px;color:var(--t3);width:14px;">${i + 1}.</span>
+          <span style="font-size:12px;color:${c};font-weight:600;flex:1;">${esc(name)}</span>
+          <span style="font-size:10px;color:var(--t3);">${cnt} (${pct}%)</span>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+
+  document.getElementById('chStatsClose').addEventListener('click', () => { ov.style.display = 'none'; });
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.style.display = 'none'; });
+}
+
+// ═══════════════════════════════════════
+// THREAD SYSTEM (Slack-style)
+// ═══════════════════════════════════════
+function getThreadReplies(parentMsgId) {
+  const allMsgs = N.store.getAll();
+  return allMsgs.filter(m => m.replyTo?.msgId === parentMsgId);
+}
+
+function showThread(parentMsgId) {
+  const parentMsg = N.store.getAll().find(m => m.msgId === parentMsgId);
+  if (!parentMsg) return;
+
+  let panel = document.getElementById('threadPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'threadPanel';
+    panel.className = 'thread-panel';
+    document.querySelector('.main').appendChild(panel);
+  }
+  panel.style.display = 'flex';
+
+  const replies = getThreadReplies(parentMsgId);
+  const parentC = hue(parentMsg.sender || '?');
+
+  let html = `<div class="thread-header">
+    <span style="font-weight:600;font-size:13px;">Thread</span>
+    <span class="thread-close" id="threadClose">✕</span>
+  </div>
+  <div class="thread-parent">
+    <div class="ms" style="color:${parentC};font-size:11px;">${esc(parentMsg.sender || '?')}${getBadgeHtml(parentMsg.senderId)}</div>
+    <div class="mb" style="font-size:12px;">${parseText(parentMsg.text || '')}</div>
+    <div class="mt">${new Date(parentMsg.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+  </div>
+  <div class="thread-replies">`;
+
+  for (const r of replies) {
+    const c = hue(r.sender || '?');
+    const ts = new Date(r.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    html += `<div class="thread-reply">
+      <div class="ms" style="color:${c};font-size:10px;">${esc(r.sender || '?')}${getBadgeHtml(r.senderId)}</div>
+      <div class="mb" style="font-size:12px;">${parseText(r.text || '')}</div>
+      <div class="mt">${ts}</div>
+    </div>`;
+  }
+
+  html += `</div>
+  <div class="thread-input-wrap">
+    <textarea class="thread-input" id="threadInput" placeholder="Reply in thread..." rows="1"></textarea>
+    <button class="sbtn" id="threadSend" style="width:auto;padding:0 10px;font-size:11px;">↑</button>
+  </div>`;
+
+  panel.innerHTML = html;
+
+  document.getElementById('threadClose').addEventListener('click', () => { panel.style.display = 'none'; });
+  document.getElementById('threadSend')?.addEventListener('click', () => {
+    const input = document.getElementById('threadInput');
+    const text = input?.value?.trim();
+    if (!text) return;
+    setReply(parentMsgId, parentMsg.sender, parentMsg.text);
+    N.sendChat(text, currentReply);
+    clearReply();
+    input.value = '';
+    // Re-render thread
+    setTimeout(() => showThread(parentMsgId), 100);
+  });
+  document.getElementById('threadInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      document.getElementById('threadSend')?.click();
+    }
+  });
+}
+
+// ═══════════════════════════════════════
+// TYPING INDICATOR UI
+// ═══════════════════════════════════════
+function updateTypingUI() {
+  const bar = document.getElementById('typingBar');
+  if (!bar) return;
+  const users = N.getTypingUsers(N.chMgr.current);
+  if (!users.length) { bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  const names = users.slice(0, 3).join(', ');
+  const dots = '<span class="typing-dots"><span></span><span></span><span></span></span>';
+  bar.innerHTML = `<em>${esc(names)}</em> ${users.length === 1 ? 'is' : 'are'} typing${dots}`;
+}
+setInterval(updateTypingUI, 1000);
+
+// ═══════════════════════════════════════
+// PINNED MESSAGES BAR
+// ═══════════════════════════════════════
+function updatePinnedBar() {
+  const bar = document.getElementById('pinnedBar');
+  const toggle = document.getElementById('pinToggle');
+  if (!bar) return;
+  const ch = N.chMgr.current;
+  const pins = N.pins[ch] || [];
+  if (!pins.length) { bar.style.display = 'none'; if (toggle) toggle.style.display = 'none'; return; }
+  if (toggle) toggle.style.display = '';
+  const lastPin = pins[pins.length - 1];
+  const msg = N.store.getAll().find(m => m.msgId === lastPin);
+  bar.style.display = 'flex';
+  bar.innerHTML = `📌 <b>${esc(msg?.sender || '?')}:</b> ${esc((msg?.text || '').slice(0, 60))} ${pins.length > 1 ? `<span style="margin-left:auto;font-size:9px;color:var(--t3);">${pins.length} pinned</span>` : ''}`;
+  bar.onclick = () => { if (msg) scrollToMessage(lastPin); };
+}
+
+// ═══════════════════════════════════════
+// READ RECEIPTS
+// ═══════════════════════════════════════
+function getReceiptHtml(msgId, isSelf, isDM) {
+  if (!isSelf || !isDM) return '';
+  const r = N.readReceipts.get(msgId);
+  if (!r) return '<span class="msg-receipt sent">✓</span>';
+  if (r.read) return '<span class="msg-receipt read">✓✓</span>';
+  if (r.delivered) return '<span class="msg-receipt delivered">✓✓</span>';
+  return '<span class="msg-receipt sent">✓</span>';
+}
+
+// ═══════════════════════════════════════
+// BADGES
+// ═══════════════════════════════════════
+function getBadgeHtml(peerId) {
+  if (!N.id) return '';
+  const badges = N.getBadges(peerId);
+  return badges.map(b => {
+    const cls = b.label === 'Admin' ? 'badge-admin' : b.label === 'Mod' ? 'badge-mod' : b.label === 'OG' ? 'badge-og' : b.label === 'Active' ? 'badge-active' : 'badge-new';
+    return `<span class="user-badge ${cls}">${b.icon}</span>`;
+  }).join('');
+}
+
+// ═══════════════════════════════════════
+// STORIES
+// ═══════════════════════════════════════
+function refreshStories() {
+  const bar = document.getElementById('storiesBar');
+  if (!bar) return;
+  const stories = N._getActiveStories();
+
+  // Group by sender
+  const bySender = new Map();
+  for (const s of stories) {
+    if (!bySender.has(s.senderId)) bySender.set(s.senderId, []);
+    bySender.get(s.senderId).push(s);
+  }
+
+  let html = `<div style="text-align:center;cursor:pointer;" class="story-add-wrap">
+    <div class="story-avatar add-story" id="storyAddBtn">+</div>
+    <div class="story-name">Story</div>
+  </div>`;
+
+  const neonColors = ['#00fff7','#ff00e4','#39ff14','#ff3131','#ffaa00','#00aaff','#ff61d8','#b4ff39'];
+
+  for (const [sid, userStories] of bySender) {
+    const latest = userStories[userStories.length - 1];
+    const name = latest.senderName || sid.slice(0, 6);
+    const c = hue(name);
+    // Neon color based on sender hash (consistent per user)
+    let hash = 0;
+    for (let i = 0; i < sid.length; i++) hash = sid.charCodeAt(i) + ((hash << 5) - hash);
+    const neon = neonColors[Math.abs(hash) % neonColors.length];
+    const neonDark = neon + '33';
+    // Show story content thumbnail (not profile photo)
+    let innerContent;
+    if (latest.image) {
+      innerContent = `<div class="story-avatar-inner" style="background-image:url(${latest.image});background-size:cover;background-position:center;"></div>`;
+    } else {
+      // Show story bg color with text preview
+      const bgC = latest.bgColor || '#22d3ee';
+      const preview = latest.text ? latest.text.slice(0, 2) : '💬';
+      innerContent = `<div class="story-avatar-inner" style="background:${bgC};display:flex;align-items:center;justify-content:center;font-size:14px;color:white;">${preview}</div>`;
+    }
+    html += `<div style="text-align:center;cursor:pointer;" data-storyuser="${esc(sid)}">
+      <div class="story-ring" style="background:conic-gradient(${neon},${neonDark},${neon},${neonDark},${neon});">${innerContent}</div>
+      <div class="story-name">${esc(name)}</div>
+    </div>`;
+  }
+  bar.innerHTML = html;
+
+  // Wire clicks
+  document.getElementById('storyAddBtn')?.addEventListener('click', () => {
+    openStoryCreator();
+  });
+
+  bar.querySelectorAll('[data-storyuser]').forEach(el => {
+    el.addEventListener('click', () => viewStory(el.dataset.storyuser));
+  });
+}
+
+function openStoryCreator() {
+  let ov = document.getElementById('storyCreator');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'storyCreator';
+    ov.className = 'gsearch-overlay';
+    document.body.appendChild(ov);
+  }
+  ov.style.display = 'flex';
+  let storyImg = null;
+  const colors = ['#22d3ee', '#a78bfa', '#f87171', '#34d399', '#fbbf24', '#fb923c', '#1a1a2e'];
+
+  ov.innerHTML = `<div class="gsearch-box" style="max-width:340px;">
+    <div class="gsearch-header" style="justify-content:space-between;">
+      <span style="font-weight:600;">📖 New Story</span>
+      <span class="gsearch-close" id="storyCreatorClose">✕</span>
+    </div>
+    <div style="padding:12px;">
+      <div id="storyImgPreview" style="display:none;margin-bottom:8px;text-align:center;"></div>
+      <div style="display:flex;gap:4px;margin-bottom:8px;">
+        ${colors.map(c => `<div class="story-color-pick" data-color="${c}" style="width:18px;height:18px;border-radius:50%;background:${c};cursor:pointer;border:2px solid transparent;"></div>`).join('')}
+      </div>
+      <div class="irow" style="padding:0;">
+        <input type="file" id="storyFileIn" accept="image/*" style="display:none;">
+        <div style="position:relative;">
+          <button class="sbtn" id="storyAttachBtn" style="background:var(--bg2);color:var(--t2);border:1px solid var(--brd);">+</button>
+          <div class="attach-menu" id="storyAttachMenu" style="display:none;">
+            <div class="attach-item" data-act="story-image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Image</div>
+          </div>
+        </div>
+        <div class="iwrap"><textarea id="storyText" placeholder="What's happening?" maxlength="280" rows="1" style="font-size:12px;"></textarea></div>
+        <button class="sbtn" id="storySubmit">&uarr;</button>
+      </div>
+    </div>
+  </div>`;
+
+  let selectedColor = colors[0];
+  ov.querySelectorAll('.story-color-pick').forEach(p => {
+    p.addEventListener('click', () => {
+      ov.querySelectorAll('.story-color-pick').forEach(x => x.style.borderColor = 'transparent');
+      p.style.borderColor = 'white';
+      selectedColor = p.dataset.color;
+    });
+  });
+  ov.querySelector('.story-color-pick').style.borderColor = 'white';
+
+  // Attach button for story
+  document.getElementById('storyAttachBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const m = document.getElementById('storyAttachMenu');
+    m.style.display = m.style.display === 'none' ? '' : 'none';
+  });
+  ov.querySelector('[data-act="story-image"]')?.addEventListener('click', () => {
+    document.getElementById('storyAttachMenu').style.display = 'none';
+    document.getElementById('storyFileIn').click();
+  });
+
+  document.getElementById('storyFileIn').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    compressImage(file, 300, 0.6, (dataUrl) => {
+      storyImg = dataUrl;
+      document.getElementById('storyImgPreview').style.display = '';
+      document.getElementById('storyImgPreview').innerHTML = `<img src="${dataUrl}" style="max-height:120px;border-radius:8px;"><br><span style="font-size:9px;color:var(--t3);cursor:pointer;" id="storyImgRm">✕ Remove</span>`;
+      document.getElementById('storyImgRm')?.addEventListener('click', () => {
+        storyImg = null;
+        document.getElementById('storyImgPreview').style.display = 'none';
+      });
+    });
+  });
+
+  document.getElementById('storyCreatorClose').addEventListener('click', () => { ov.style.display = 'none'; });
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.style.display = 'none'; });
+  document.getElementById('storySubmit').addEventListener('click', () => {
+    const text = document.getElementById('storyText').value.trim();
+    if (!text && !storyImg) return;
+    N.sendStory(text, selectedColor, storyImg);
+    ov.style.display = 'none';
+    refreshStories();
+  });
+  document.getElementById('storyText')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('storySubmit')?.click(); }
+  });
+}
+
+function viewStory(senderId) {
+  const stories = [];
+  for (const [, s] of N.stories) {
+    if (s.senderId === senderId && s.expiresAt > Date.now()) stories.push(s);
+  }
+  if (!stories.length) return;
+  let idx = 0;
+
+  const show = () => {
+    const s = stories[idx];
+    const ago = Math.round((Date.now() - s.ts) / 60000);
+    const timeStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+
+    let ov = document.getElementById('storyViewer');
+    if (!ov) {
+      ov = document.createElement('div');
+      ov.id = 'storyViewer';
+      ov.className = 'story-viewer';
+      document.body.appendChild(ov);
+    }
+    ov.style.display = 'flex';
+    ov.innerHTML = `
+      <div class="story-header"><span class="story-header-name">${esc(s.senderName || '?')}</span><span class="story-header-time">${timeStr}</span></div>
+      <span class="story-close" id="storyClose">✕</span>
+      <div class="story-content" style="background:${s.image ? '#000' : (s.bgColor || '#22d3ee')};color:white;flex-direction:column;gap:12px;">
+        ${s.image ? `<img src="${s.image}" style="max-width:100%;max-height:50vh;border-radius:8px;">` : ''}
+        ${s.text ? `<div>${esc(s.text)}</div>` : ''}
+      </div>`;
+    document.getElementById('storyClose').onclick = () => { ov.style.display = 'none'; };
+    ov.onclick = (e) => {
+      if (e.target === ov || e.target.classList.contains('story-content')) {
+        idx++;
+        if (idx < stories.length) show(); else ov.style.display = 'none';
+      }
+    };
+  };
+  show();
+}
+
+// ═══════════════════════════════════════
+// PLAZA (Stories + Social Posts with images)
+// ═══════════════════════════════════════
+let _plazaPostImage = null; // { dataUrl, file } for pending post image
+
+function refreshPlaza() {
+  refreshStories();
+  refreshPlazaFeed();
+}
+
+function refreshPlazaFeed() {
+  const el = document.getElementById('plazaFeed');
+  if (!el) return;
+
+  // Collect all posts from all users
+  const allPosts = [];
+  for (const p of (N.profile.posts || [])) allPosts.push(p);
+  for (const [, prof] of N.peerProfiles) {
+    for (const p of (prof.posts || [])) allPosts.push(p);
+  }
+  allPosts.sort((a, b) => b.ts - a.ts);
+
+  if (!allPosts.length) {
+    el.innerHTML = '<div class="empty" style="padding:20px;font-size:12px;">No posts yet. Be the first to share something!</div>';
+    return;
+  }
+
+  el.innerHTML = allPosts.slice(0, 50).map(p => {
+    const c = hue(p.senderName || '?');
+    const profile = N.getProfile(p.senderId);
+    const emoji = profile.emoji || (p.senderName || '?')[0]?.toUpperCase();
+    const hasAvatar = profile.avatar?.startsWith('data:');
+    const avatarStyle = hasAvatar
+      ? `background-image:url(${profile.avatar});background-size:cover;background-position:center;color:transparent;`
+      : `background:${c}18;color:${c};`;
+    const ago = timeAgo(p.ts);
+    const liked = p.likes?.includes(N.id);
+    const likeCount = p.likes?.length || 0;
+    const badges = getBadgeHtml(p.senderId);
+    // Image
+    const imgHtml = p.image ? `<div class="plaza-post-img"><img src="${p.image}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;"></div>` : '';
+    return `<div class="live-post" data-postid="${esc(p.id)}">
+      <div class="live-post-header">
+        <div class="live-post-avatar" style="${avatarStyle}">${hasAvatar ? '' : emoji}</div>
+        <div>
+          <span class="live-post-name" data-pid="${esc(p.senderId)}" style="color:${c};">${esc(p.senderName || '?')}${badges}</span>
+          <div class="live-post-time">${ago}</div>
+        </div>
+      </div>
+      ${imgHtml}
+      <div class="live-post-text">${parseText(p.text)}</div>
+      <div class="live-post-actions">
+        <span class="live-post-action${liked ? ' liked' : ''}" data-postid="${esc(p.id)}" data-owner="${esc(p.senderId)}">${liked ? '❤️' : '🤍'} ${likeCount || ''}</span>
+        <span class="live-post-action" data-postshare="${esc(p.id)}" data-shareowner="${esc(p.senderId)}" data-sharename="${esc(p.senderName || '?')}" data-sharetext="${esc((p.text || '').slice(0,60))}">↗ Share</span>
+        <span class="live-post-action" data-postcopy="${esc(p.id)}">🔗 Link</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Wire clicks
+  el.querySelectorAll('.live-post-name').forEach(n => {
+    n.addEventListener('click', () => showProfile(n.dataset.pid));
+  });
+  el.querySelectorAll('.live-post-action[data-postid]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      N.likeSocialPost(btn.dataset.postid, btn.dataset.owner);
+    });
+  });
+  el.querySelectorAll('.live-post-action[data-postshare]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const postId = btn.dataset.postshare;
+      const ownerName = btn.dataset.sharename;
+      const preview = btn.dataset.sharetext || 'a post';
+      // Send ephemeral share card to current channel
+      sharePostToChannel(postId, ownerName, preview);
+    });
+  });
+  // Copy Link handler
+  el.querySelectorAll('.live-post-action[data-postcopy]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const postId = btn.dataset.postcopy;
+      const base = window.location.origin + window.location.pathname;
+      const link = `${base}#plaza/${encodeURIComponent(postId)}`;
+      copyLink(link);
+    });
+  });
+}
+
+function timeAgo(ts) {
+  const diff = (Date.now() - ts) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  return `${Math.floor(diff / 86400)}d`;
+}
+
+// Image compression for P2P gossip (max ~100KB base64)
+function compressImage(file, maxDim, quality, callback) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let w = img.width, h = img.height;
+      if (w > maxDim || h > maxDim) {
+        if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+        else { w = Math.round(w * maxDim / h); h = maxDim; }
+      }
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      callback(canvas.toDataURL('image/jpeg', quality || 0.6));
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+// ═══════════════════════════════════════
+// ENHANCED PROFILE CARD
+// ═══════════════════════════════════════
+function showEnhancedProfile(peerId) {
+  const prof = N.getProfile(peerId);
+  const c = hue(prof.name);
+  const isSelf = peerId === N.id;
+  const badges = getBadgeHtml(peerId);
+  const isImgAvatar = prof.avatar?.startsWith('data:');
+  const avatarHtml = isImgAvatar
+    ? `<div class="pc-emoji-avatar" style="width:64px;height:64px;border-radius:50%;background-image:url(${prof.avatar});background-size:cover;background-position:center;margin:0 auto;"></div>`
+    : `<div class="pc-emoji-avatar">${prof.emoji || (prof.name[0]?.toUpperCase() || '?')}</div>`;
+
+  // Stats
+  const allMsgs = N.store.getAll().filter(m => m.senderId === peerId);
+  const channels = new Set(allMsgs.map(m => m.channel)).size;
+  const lastSeen = prof.online ? 'Online' : (prof.lastSeen ? timeAgo(prof.lastSeen) + ' ago' : 'Unknown');
+  const statusClass = prof.online ? 'pc-status-online' : 'pc-status-offline';
+  const statusIcon = prof.status === 'online' ? '🟢' : prof.status === 'dnd' ? '🔴' : prof.status === 'afk' ? '⏳' : '🟢';
+  const statusText = prof.status === 'dnd' ? 'Do not disturb' : prof.status === 'afk' ? 'Away' : prof.status || 'Available';
+
+  // Recent posts
+  const posts = (prof.posts || []).slice(-5).reverse();
+  const postsHtml = posts.length ? posts.map(p => `<div class="pc-post-mini">${esc((p.text || '').slice(0, 80))} <span style="color:var(--t3);font-size:9px;">${timeAgo(p.ts)}</span></div>`).join('') : '<div style="font-size:10px;color:var(--t3);padding:4px 0;">No posts yet</div>';
+
+  const modal = document.getElementById('profileModal');
+  const card = document.getElementById('profileCard');
+  modal.style.display = 'flex';
+  card.innerHTML = `
+    <div class="pc-profile-section">
+      ${avatarHtml}
+      <div style="text-align:center;font-size:14px;font-weight:700;color:${c};">${esc(prof.name)}${badges}</div>
+      <div class="pc-status ${statusClass}">${statusIcon} ${esc(statusText)}</div>
+      ${prof.bio ? `<div class="pc-bio">"${esc(prof.bio)}"</div>` : ''}
+      <div style="font-size:9px;color:var(--t3);text-align:center;">${esc(prof.id.slice(0, 16))}…</div>
+    </div>
+    <div class="pc-stats">
+      <div><span class="pc-stat-val">${allMsgs.length}</span>messages</div>
+      <div><span class="pc-stat-val">${channels}</span>channels</div>
+      <div><span class="pc-stat-val">${lastSeen}</span>last seen</div>
+    </div>
+    <div class="pc-posts-section">
+      <div style="font-size:9px;color:var(--t3);text-transform:uppercase;margin-bottom:4px;">Recent Posts</div>
+      ${postsHtml}
+    </div>
+    ${isSelf ? `<div class="pc-edit-btn" id="pcEditProfile">✏️ Edit Profile</div>` : ''}
+    <div style="display:flex;gap:6px;margin-top:8px;">
+      ${!isSelf ? `<button class="pc-btn" id="pcDm">💬 Message</button>` : ''}
+      ${!isSelf ? `<button class="pc-btn" id="pcBlock" style="background:var(--red)22;color:var(--red);">🚫 Block</button>` : ''}
+      <button class="pc-btn" id="pcClose" style="background:var(--bg3);">Close</button>
+    </div>`;
+
+  // Wire events
+  document.getElementById('pcClose')?.addEventListener('click', () => { modal.style.display = 'none'; });
+  document.getElementById('pcDm')?.addEventListener('click', () => { modal.style.display = 'none'; N.startDM(peerId); });
+  document.getElementById('pcBlock')?.addEventListener('click', () => { N.blocked.add(peerId); DB.setKey('blocked', [...N.blocked]); modal.style.display = 'none'; });
+  document.getElementById('pcEditProfile')?.addEventListener('click', openProfileEditor);
+  modal.onclick = (e) => { if (e.target === modal) modal.style.display = 'none'; };
+}
+
+function openProfileEditor() {
+  document.getElementById('profileModal').style.display = 'none';
+
+  let ov = document.getElementById('profileEditor');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'profileEditor';
+    ov.className = 'gsearch-overlay';
+    document.body.appendChild(ov);
+  }
+  ov.style.display = 'flex';
+
+  const prof = N.profile;
+  const currentAvatar = prof.avatar || prof.emoji || N.name[0]?.toUpperCase() || '?';
+  const isImg = prof.avatar?.startsWith('data:');
+  const c = hue(N.name);
+
+  ov.innerHTML = `<div class="gsearch-box" style="max-width:360px;">
+    <div class="gsearch-header" style="justify-content:space-between;">
+      <span style="font-weight:600;">✏️ Edit Profile</span>
+      <span class="gsearch-close" id="profEdClose">✕</span>
+    </div>
+    <div style="padding:16px;">
+      <!-- Avatar -->
+      <div style="text-align:center;margin-bottom:12px;">
+        <div id="profEdAvatar" class="prof-ed-avatar" style="background:${isImg ? 'none' : c + '18'};color:${c};${isImg ? `background-image:url(${prof.avatar});background-size:cover;background-position:center;color:transparent;` : ''}">${isImg ? '' : currentAvatar}</div>
+        <div style="margin-top:6px;">
+          <label class="prof-ed-upload-btn" id="profEdAvatarBtn">Change Photo<input type="file" id="profEdAvatarIn" accept="image/*" style="display:none;"></label>
+        </div>
+      </div>
+      <!-- Bio -->
+      <div class="prof-ed-label">Bio</div>
+      <textarea class="prof-ed-input" id="profEdBio" placeholder="Tell people about yourself..." maxlength="150" rows="2">${esc(prof.bio || '')}</textarea>
+      <!-- Status -->
+      <div class="prof-ed-label">Status</div>
+      <div class="prof-ed-status-row">
+        <div class="prof-ed-status-opt${prof.status === 'online' || !prof.status ? ' active' : ''}" data-status="online">🟢 Online</div>
+        <div class="prof-ed-status-opt${prof.status === 'dnd' ? ' active' : ''}" data-status="dnd">🔴 DND</div>
+        <div class="prof-ed-status-opt${prof.status === 'afk' ? ' active' : ''}" data-status="afk">⏳ AFK</div>
+      </div>
+      <!-- Emoji (optional, instead of photo) -->
+      <div class="prof-ed-label">Emoji Avatar <span style="color:var(--t3);font-weight:400;">(or use photo above)</span></div>
+      <input class="prof-ed-input" id="profEdEmoji" placeholder="Pick an emoji: 🐱 🚀 💀" value="${esc(prof.emoji || '')}" maxlength="2" style="text-align:center;font-size:20px;">
+      <!-- Save -->
+      <button class="sbtn" id="profEdSave" style="width:100%;margin-top:12px;font-size:12px;">Save Profile</button>
+    </div>
+  </div>`;
+
+  let selectedStatus = prof.status || 'online';
+  let avatarDataUrl = prof.avatar || null;
+
+  // Status selection
+  ov.querySelectorAll('.prof-ed-status-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      ov.querySelectorAll('.prof-ed-status-opt').forEach(x => x.classList.remove('active'));
+      opt.classList.add('active');
+      selectedStatus = opt.dataset.status;
+    });
+  });
+
+  // Avatar upload
+  document.getElementById('profEdAvatarIn').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    compressImage(file, 150, 0.7, (dataUrl) => {
+      avatarDataUrl = dataUrl;
+      const av = document.getElementById('profEdAvatar');
+      av.style.backgroundImage = `url(${dataUrl})`;
+      av.style.backgroundSize = 'cover';
+      av.style.backgroundPosition = 'center';
+      av.style.color = 'transparent';
+      av.textContent = '';
+    });
+  });
+
+  // Close
+  document.getElementById('profEdClose').addEventListener('click', () => { ov.style.display = 'none'; });
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.style.display = 'none'; });
+
+  // Save
+  document.getElementById('profEdSave').addEventListener('click', () => {
+    const bio = document.getElementById('profEdBio').value.trim();
+    const emoji = document.getElementById('profEdEmoji').value.trim();
+    N.updateProfile({ bio, emoji, status: selectedStatus, avatar: avatarDataUrl });
+    ov.style.display = 'none';
+  });
+}
+
+// ═══════════════════════════════════════
+// THEME SYSTEM
+// ═══════════════════════════════════════
+const THEMES = {
+  midnight: { name: 'Midnight', dots: ['#0c0e14','#22d3ee','#34d399'] },
+  light:    { name: 'Light',    dots: ['#ffffff','#0891b2','#059669'] },
+  nord:     { name: 'Nord',     dots: ['#2e3440','#88c0d0','#a3be8c'] },
+  dracula:  { name: 'Dracula',  dots: ['#282a36','#8be9fd','#bd93f9'] },
+  ocean:    { name: 'Ocean',    dots: ['#0a192f','#64ffda','#c792ea'] },
+  ember:    { name: 'Ember',    dots: ['#1a1110','#fb923c','#f472b6'] },
+  matrix:   { name: 'Matrix',   dots: ['#0a0a0a','#00ff41','#00ff41'] },
+};
+
+let currentTheme = 'midnight';
+
+function applyTheme(themeName) {
+  if (themeName === 'custom') {
+    // Custom theme is applied via CSS vars directly
+    document.documentElement.removeAttribute('data-theme');
+  } else {
+    document.documentElement.setAttribute('data-theme', themeName);
+  }
+  currentTheme = themeName;
+  DB.setKey('theme', themeName);
+}
+
+// Load saved theme on startup
+(async () => {
+  try {
+    await DB.open();
+    const saved = await DB.getKey('theme');
+    if (saved && (THEMES[saved] || saved === 'custom')) {
+      applyTheme(saved);
+      // Load custom colors if custom theme
+      if (saved === 'custom') {
+        const cc = await DB.getKey('themeCustomColors');
+        if (cc) {
+          for (const [k, v] of Object.entries(cc)) {
+            document.documentElement.style.setProperty(k, v);
+          }
+        }
+      }
+    }
+  } catch(_) {}
+})();
+
+function openThemePicker() {
+  let picker = document.getElementById('themePicker');
+  if (picker) { picker.remove(); return; }
+
+  picker = document.createElement('div');
+  picker.id = 'themePicker';
+  picker.className = 'theme-picker';
+  picker.addEventListener('click', (e) => e.stopPropagation());
+
+  let html = `<div class="theme-picker-title">Choose Theme</div><div class="theme-grid">`;
+  for (const [id, t] of Object.entries(THEMES)) {
+    const isActive = currentTheme === id ? ' active' : '';
+    html += `<div class="theme-card${isActive}" data-theme="${id}">
+      <div class="theme-card-dots">${t.dots.map(c => `<div class="theme-card-dot" style="background:${c}"></div>`).join('')}</div>
+      <div class="theme-card-name">${t.name}</div>
+    </div>`;
+  }
+  html += `</div>`;
+
+  // Custom color section
+  html += `<div class="theme-custom-section">
+    <div class="theme-custom-title">Custom Colors</div>
+    <div class="theme-color-row"><span class="theme-color-label">Background</span><input type="color" class="theme-color-input" data-var="--bg0" value="${getComputedStyle(document.documentElement).getPropertyValue('--bg0').trim() || '#0c0e14'}"></div>
+    <div class="theme-color-row"><span class="theme-color-label">Surface</span><input type="color" class="theme-color-input" data-var="--bg1" value="${getComputedStyle(document.documentElement).getPropertyValue('--bg1').trim() || '#13161e'}"></div>
+    <div class="theme-color-row"><span class="theme-color-label">Accent</span><input type="color" class="theme-color-input" data-var="--cyan" value="${getComputedStyle(document.documentElement).getPropertyValue('--cyan').trim() || '#22d3ee'}"></div>
+    <div class="theme-color-row"><span class="theme-color-label">Text</span><input type="color" class="theme-color-input" data-var="--t1" value="${getComputedStyle(document.documentElement).getPropertyValue('--t1').trim() || '#e2e8f0'}"></div>
+  </div>`;
+
+  picker.innerHTML = html;
+  document.body.appendChild(picker);
+
+  // Theme card clicks
+  picker.querySelectorAll('.theme-card').forEach(card => {
+    card.addEventListener('click', () => {
+      applyTheme(card.dataset.theme);
+      picker.querySelectorAll('.theme-card').forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
+    });
+  });
+
+  // Custom color inputs
+  picker.querySelectorAll('.theme-color-input').forEach(inp => {
+    inp.addEventListener('input', () => {
+      document.documentElement.style.setProperty(inp.dataset.var, inp.value);
+      // Auto-derive related colors
+      if (inp.dataset.var === '--bg0') {
+        const bg = inp.value;
+        document.documentElement.style.setProperty('--bg1', lightenColor(bg, 8));
+        document.documentElement.style.setProperty('--bg2', lightenColor(bg, 16));
+        document.documentElement.style.setProperty('--bg3', lightenColor(bg, 24));
+        document.documentElement.style.setProperty('--brd', lightenColor(bg, 30));
+      }
+      if (inp.dataset.var === '--t1') {
+        document.documentElement.style.setProperty('--t2', dimColor(inp.value, 0.6));
+        document.documentElement.style.setProperty('--t3', dimColor(inp.value, 0.4));
+      }
+      document.documentElement.removeAttribute('data-theme');
+      currentTheme = 'custom';
+      // Save custom colors
+      const colors = {};
+      picker.querySelectorAll('.theme-color-input').forEach(i => { colors[i.dataset.var] = i.value; });
+      DB.setKey('themeCustomColors', colors);
+      DB.setKey('theme', 'custom');
+    });
+  });
+}
+
+// Color utility: lighten hex color
+function lightenColor(hex, amount) {
+  const num = parseInt(hex.replace('#', ''), 16);
+  const r = Math.min(255, (num >> 16) + amount);
+  const g = Math.min(255, ((num >> 8) & 0x00FF) + amount);
+  const b = Math.min(255, (num & 0x0000FF) + amount);
+  return `#${(1 << 24 | r << 16 | g << 8 | b).toString(16).slice(1)}`;
+}
+
+// Color utility: dim color by factor
+function dimColor(hex, factor) {
+  const num = parseInt(hex.replace('#', ''), 16);
+  const r = Math.round((num >> 16) * factor);
+  const g = Math.round(((num >> 8) & 0x00FF) * factor);
+  const b = Math.round((num & 0x0000FF) * factor);
+  return `#${(1 << 24 | r << 16 | g << 8 | b).toString(16).slice(1)}`;
+}
+
+// ═══════════════════════════════════════
 // 9. EVENT HANDLERS
 // ═══════════════════════════════════════
 
@@ -1265,11 +2141,12 @@ document.querySelectorAll('.stab').forEach(t => {
     document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
     document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
     t.classList.add('on');
-    const m = { channels: 'pnChannels', peers: 'pnPeers', saved: 'pnSaved', dht: 'pnDht', net: 'pnNet', admin: 'pnAdmin' };
+    const m = { channels: 'pnChannels', plaza: 'pnPlaza', peers: 'pnPeers', saved: 'pnSaved', dht: 'pnDht', net: 'pnNet', admin: 'pnAdmin' };
     document.getElementById(m[t.dataset.t]).classList.add('on');
     if (t.dataset.t === 'net') setTimeout(drawNet, 60);
     if (t.dataset.t === 'admin') { refreshAdmin(); setAdminAlert(false); }
     if (t.dataset.t === 'saved') refreshSaved();
+    if (t.dataset.t === 'plaza') refreshPlaza();
   });
 });
 
@@ -1280,6 +2157,8 @@ document.getElementById('sBtn').addEventListener('click', doSend);
 mIn.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } });
 mIn.addEventListener('input', () => {
   mIn.style.height = 'auto'; mIn.style.height = Math.min(mIn.scrollHeight, 80) + 'px';
+  // Send typing indicator
+  if (mIn.value.trim() && N.id) N.sendTyping(N.chMgr.current);
   // Mention autocomplete
   const v = mIn.value; const atIdx = v.lastIndexOf('@');
   if (atIdx >= 0 && atIdx === v.length - 1 || (atIdx >= 0 && !v.slice(atIdx).includes(' '))) {
@@ -1290,14 +2169,14 @@ mIn.addEventListener('input', () => {
 
 // File attach — now through attach menu
 document.getElementById('attachBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleAttachMenu(); });
-document.querySelectorAll('.attach-item').forEach(item => {
+document.querySelectorAll('#attachMenu .attach-item').forEach(item => {
   item.addEventListener('click', (e) => {
     e.stopPropagation();
     closeAttachMenu();
     const act = item.dataset.act;
-    if (act === 'file') document.getElementById('fileIn').click();
+    if (act === 'image') document.getElementById('fileIn').click();
     else if (act === 'poll') togglePollCreate();
-    else if (act === 'emoji') toggleEmojiPicker();
+    else if (act === 'emoji') { _emojiTarget = 'mIn'; toggleEmojiPicker(); }
   });
 });
 document.getElementById('fileIn').addEventListener('change', async (e) => {
@@ -1309,7 +2188,11 @@ document.getElementById('fileIn').addEventListener('change', async (e) => {
 // Close attach menu on outside click
 document.addEventListener('click', (e) => {
   if (!e.target.closest('#attachBtn') && !e.target.closest('#attachMenu')) closeAttachMenu();
-  if (!e.target.closest('.emoji-picker') && !e.target.closest('.attach-item[data-act="emoji"]')) document.getElementById('emojiPicker').style.display = 'none';
+  if (!e.target.closest('#plazaAttachBtn') && !e.target.closest('#plazaAttachMenu')) {
+    const pm = document.getElementById('plazaAttachMenu');
+    if (pm) pm.style.display = 'none';
+  }
+  if (!e.target.closest('.emoji-picker') && !e.target.closest('.attach-item[data-act="emoji"]') && !e.target.closest('.attach-item[data-act="plaza-emoji"]')) document.getElementById('emojiPicker').style.display = 'none';
 });
 
 // Poll creation
@@ -1320,8 +2203,81 @@ document.getElementById('pollCreateClose')?.addEventListener('click', () => { do
 // Channel topic click
 document.getElementById('chTopic')?.addEventListener('click', editTopic);
 
+// Channel stats
+document.getElementById('chStatsBtn')?.addEventListener('click', showChannelStats);
+
 // Global search
 document.getElementById('globalSearchToggle')?.addEventListener('click', openGlobalSearch);
+
+// Share channel link
+document.getElementById('shareChBtn')?.addEventListener('click', () => {
+  const ch = N.chMgr?.current || 'general';
+  copyLink(getChannelLink(ch));
+});
+
+// Theme toggle
+document.getElementById('themeBtn')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openThemePicker();
+});
+
+// Plaza post composer
+document.getElementById('plazaAttachBtn')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const m = document.getElementById('plazaAttachMenu');
+  m.style.display = m.style.display === 'none' ? '' : 'none';
+});
+document.querySelectorAll('#plazaAttachMenu .attach-item').forEach(item => {
+  item.addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('plazaAttachMenu').style.display = 'none';
+    const act = item.dataset.act;
+    if (act === 'plaza-image') document.getElementById('plazaFileIn').click();
+    else if (act === 'plaza-emoji') { _emojiTarget = 'plazaPostInput'; toggleEmojiPicker(); }
+  });
+});
+document.getElementById('plazaFileIn')?.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  compressImage(file, 400, 0.7, (dataUrl) => {
+    _plazaPostImage = dataUrl;
+    const prev = document.getElementById('plazaImgPreview');
+    prev.style.display = '';
+    prev.innerHTML = `<div style="padding:6px 10px;"><img src="${dataUrl}" style="max-height:80px;border-radius:6px;"><span style="font-size:10px;color:var(--t3);cursor:pointer;margin-left:8px;vertical-align:top;" id="plazaImgRm">✕</span></div>`;
+    document.getElementById('plazaImgRm')?.addEventListener('click', () => {
+      _plazaPostImage = null;
+      prev.style.display = 'none';
+      prev.innerHTML = '';
+    });
+  });
+  e.target.value = '';
+});
+document.getElementById('plazaPostSend')?.addEventListener('click', () => {
+  const input = document.getElementById('plazaPostInput');
+  const text = input?.value?.trim();
+  if (!text && !_plazaPostImage) return;
+  N.sendSocialPost(text, _plazaPostImage);
+  input.value = '';
+  input.style.height = 'auto';
+  _plazaPostImage = null;
+  const prev = document.getElementById('plazaImgPreview');
+  if (prev) { prev.style.display = 'none'; prev.innerHTML = ''; }
+  refreshPlazaFeed();
+});
+document.getElementById('plazaPostInput')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('plazaPostSend')?.click(); }
+});
+document.getElementById('plazaPostInput')?.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 80) + 'px';
+});
+// Close theme picker on outside click
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.theme-picker') && !e.target.closest('#themeBtn')) {
+    const picker = document.getElementById('themePicker');
+    if (picker) picker.remove();
+  }
+});
 
 // New channel input
 document.getElementById('chNewIn').addEventListener('keydown', (e) => {
@@ -1375,8 +2331,119 @@ async function go() {
   if (!n) return document.getElementById('nIn').focus();
   document.getElementById('ov').classList.add('gone');
   await N.init(n);
+
+  // URL routing: read hash and navigate
+  handleUrlRoute();
+
   setInterval(ui, 3000);
 }
+
+// ═══ URL ROUTING ═══
+// Format: #channel or #channel/msgId
+// general channel = no hash (clean URL)
+function handleUrlRoute() {
+  const hash = window.location.hash.slice(1);
+  if (!hash) return;
+
+  const parts = hash.split('/');
+  const first = decodeURIComponent(parts[0]).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+
+  // Plaza deep link: #plaza/postId
+  if (first === 'plaza') {
+    const postId = parts[1] ? decodeURIComponent(parts[1]) : null;
+    // Switch to Plaza tab
+    document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
+    document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
+    const plazaTab = document.querySelector('.stab[data-t="plaza"]');
+    if (plazaTab) plazaTab.classList.add('on');
+    document.getElementById('pnPlaza')?.classList.add('on');
+    refreshPlaza();
+    if (postId) {
+      setTimeout(() => {
+        const postEl = document.querySelector(`.live-post[data-postid="${CSS.escape(postId)}"]`);
+        if (postEl) {
+          postEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          postEl.style.outline = '2px solid var(--cyan)';
+          setTimeout(() => { postEl.style.outline = ''; }, 3000);
+        }
+      }, 300);
+    }
+    return;
+  }
+
+  const channel = first;
+  const msgId = parts[1] ? decodeURIComponent(parts[1]) : null;
+
+  if (channel) {
+    switchChannel(channel, true);
+  }
+  if (msgId) {
+    scrollToMessage(msgId);
+  }
+}
+
+function scrollToMessage(msgId) {
+  // Try immediately, then retry a few times (messages may still be rendering)
+  let attempts = 0;
+  const tryScroll = () => {
+    const msg = document.querySelector(`.m[data-mid="${CSS.escape(msgId)}"]`);
+    if (msg) {
+      msg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      msg.style.outline = '2px solid var(--cyan)';
+      msg.style.transition = 'outline 0.3s';
+      setTimeout(() => { msg.style.outline = ''; }, 3000);
+      return true;
+    }
+    if (++attempts < 10) setTimeout(tryScroll, 300);
+    return false;
+  };
+  setTimeout(tryScroll, 200);
+}
+
+// Get shareable link for a channel
+function getChannelLink(channel) {
+  const base = window.location.origin + window.location.pathname;
+  if (!channel || channel === 'general') return base;
+  return `${base}#${encodeURIComponent(channel)}`;
+}
+
+// Get shareable link for a specific message
+function getMessageLink(channel, msgId) {
+  const base = window.location.origin + window.location.pathname;
+  const ch = (!channel || channel === 'general') ? '' : encodeURIComponent(channel);
+  if (!ch) return `${base}#general/${encodeURIComponent(msgId)}`;
+  return `${base}#${ch}/${encodeURIComponent(msgId)}`;
+}
+
+// Copy link to clipboard with toast feedback
+async function copyLink(link) {
+  try {
+    await navigator.clipboard.writeText(link);
+    showToastSimple('🔗 Link copied!');
+  } catch (_) {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = link; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    showToastSimple('🔗 Link copied!');
+  }
+}
+
+// Simple toast (no channel tracking)
+function showToastSimple(text) {
+  const box = document.getElementById('toastBox');
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.innerHTML = `<span class="toast-icon">✓</span><div class="toast-body"><div class="toast-text">${esc(text)}</div></div>`;
+  box.appendChild(t);
+  setTimeout(() => { if (t.parentNode) t.remove(); }, 2500);
+}
+
+// Back/forward button support
+window.addEventListener('hashchange', () => {
+  if (N.id) handleUrlRoute(); // only if initialized
+});
 
 // Check for stored username on load
 (async () => {
@@ -1403,7 +2470,7 @@ document.getElementById('resetBtn').addEventListener('click', async () => {
 window.addEventListener('resize', () => setTimeout(drawNet, 80));
 
 // Close action popup on outside click
-document.addEventListener('click', () => closeActionPopup());
+document.addEventListener('click', () => { if (Date.now() - _popupCooldown > 200) closeActionPopup(); });
 
 // ── Mobile drawer ──
 function closeMobileDrawer() {
