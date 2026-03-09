@@ -558,3 +558,6 @@ html,body{height:100%;overflow:hidden;font-family:var(--body);background:var(--b
 .plaza-share-text{font-size:12px;color:var(--t1);margin-bottom:8px;line-height:1.4;}
 .plaza-share-btn{font-size:11px;color:var(--cyan);cursor:pointer;font-weight:600;padding:5px 12px;border:1px solid var(--cyan);border-radius:6px;display:inline-block;transition:background 0.15s;}
 .plaza-share-btn:hover{background:rgba(34,211,238,0.1);}
+
+/* ═══ VERSION BADGE ═══ */
+.brand-ver{font-family:var(--mono);font-size:9px;color:var(--t3);margin-left:4px;opacity:0.6;font-weight:400;}

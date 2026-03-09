@@ -121,6 +121,7 @@ class Node {
     this.ws.onopen = () => {
       this._wsConnecting = false;
       this._wsRetry = 1;
+      this._bsFailed = false;
       this._setStatus('connected');
       console.log('Bootstrap connected');
       this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name }));
@@ -132,9 +133,55 @@ class Node {
       const delay = Math.min((this._wsRetry || 1) * 1000, 10000);
       this._wsRetry = Math.min((this._wsRetry || 1) * 2, 10);
       console.log(`Bootstrap lost, retry in ${delay}ms`);
+
+      // If bootstrap fails repeatedly, try peer cache
+      if (!this._bsFailed) {
+        this._bsFailed = true;
+        this._tryPeerCache();
+      }
+
       setTimeout(() => this.connectBS(), delay);
     };
     this.ws.onerror = () => { this._wsConnecting = false; };
+  }
+
+  // ── Peer cache: reconnect without bootstrap ──
+  async _tryPeerCache() {
+    try {
+      const cached = await DB.getPeers();
+      if (!cached || !cached.length) return;
+
+      // Sort by most recently seen
+      cached.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+      const candidates = cached.slice(0, 5);
+      console.log(`Bootstrap down — trying ${candidates.length} cached peer(s)`);
+
+      for (const p of candidates) {
+        if (p.id === this.id || this.peers.has(p.id) || this.pending.has(p.id)) continue;
+        // We can't initiate WebRTC without signaling, but if we have ANY connected peer,
+        // ask them to relay our signaling to the cached peer
+        if (this.peers.size > 0) {
+          this._requestPeerRelay(p.id, p.name);
+        }
+      }
+
+      // Also: if we have connected peers, we're still alive even without bootstrap
+      if (this.peers.size > 0) {
+        this._setStatus('connected');
+        console.log(`Still connected to ${this.peers.size} peer(s) without bootstrap`);
+      }
+    } catch (e) {
+      console.error('Peer cache error:', e);
+    }
+  }
+
+  // Ask a connected peer to relay signaling to a target peer
+  _requestPeerRelay(targetId, targetName) {
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'signal-relay-request', targetId, targetName, fromId: this.id, fromName: this.name });
+      console.log(`Requested relay to ${targetName || targetId.slice(0, 8)} via ${pid.slice(0, 8)}`);
+      return; // Ask one peer only
+    }
   }
 
   // Full reconnect — drop all dead peers, reconnect bootstrap, re-establish P2P
@@ -159,7 +206,7 @@ class Node {
     this._status = s;
     const tag = document.getElementById('statusTag');
     if (!tag) return;
-    tag.textContent = 'v9 · E2E';
+    tag.textContent = 'v1.1';
     if (s === 'connected') tag.className = 'tag tag-on';
     else if (s === 'reconnecting') tag.className = 'tag tag-warn';
     else tag.className = 'tag tag-off';
@@ -612,6 +659,8 @@ class Node {
       case 'profile-update': this.onProfileUpdate(d, from); break;
       case 'pin': this.onPin(d, from); break;
       case 'social-post': this.onSocialPost(d, from); break;
+      case 'signal-relay-request': this._onRelayRequest(d, from); break;
+      case 'signal-relay': this._onRelaySignal(d, from); break;
     }
   }
 
@@ -1392,7 +1441,6 @@ class Node {
 
   snap() { const n = []; for (const b of this.rt.bkts) for (const x of b) n.push({ id: x.id, name: x.name }); return n.slice(0, 50); }
   sendTo(pid, d) { const p = this.peers.get(pid); if (p?.ch?.readyState === 'open') try { p.ch.send(JSON.stringify(d)); } catch (e) { console.error('Send:', e); } }
-  sig(to, s) { if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s })); }
 
   // ═══════════════════════════════════════
   // SOCIAL FEATURES (v21)
@@ -1651,5 +1699,53 @@ class Node {
     const peer = this.peers.get(peerId);
     if (peer && Date.now() - (this.trust.firstSeen?.[peerId] || peer.seen) < 3600 * 1000) badges.push({ icon: '🆕', label: 'New' });
     return badges;
+  }
+
+  // ═══ P2P SIGNALING RELAY ═══
+  // When bootstrap is down, peers relay signaling for each other
+
+  // Someone asks us to relay their signaling to a target peer
+  _onRelayRequest(d, from) {
+    if (!d.targetId || !d.fromId) return;
+    // If we're connected to the target, forward the request
+    if (this.peers.has(d.targetId)) {
+      this.sendTo(d.targetId, { type: 'signal-relay', signal: { type: 'relay-offer', fromId: d.fromId, fromName: d.fromName }, relayedBy: this.id });
+      console.log(`Relaying signal request from ${d.fromName || d.fromId.slice(0,8)} to ${d.targetId.slice(0,8)}`);
+    }
+  }
+
+  // Receive a relayed signal — start connection
+  _onRelaySignal(d, from) {
+    if (!d.signal) return;
+    const sig = d.signal;
+    if (sig.type === 'relay-offer' && sig.fromId) {
+      // Someone wants to connect to us via relay — initiate connection through relay
+      if (!this.peers.has(sig.fromId) && !this.pending.has(sig.fromId)) {
+        console.log(`Relay connection from ${sig.fromName || sig.fromId.slice(0,8)} via ${from.slice(0,8)}`);
+        // Start connection but use relay peer for signaling instead of bootstrap
+        this._relayPeer = from;
+        this.startConn(sig.fromId, sig.fromName || 'peer');
+      }
+    } else if (sig.sdp || sig.candidate) {
+      // Relayed ICE/SDP — forward to pending connection
+      const target = sig.targetId || sig.from;
+      if (target) this.onSig({ signal: sig, from: target, fromName: sig.fromName });
+    }
+  }
+
+  // Override sig() to use relay when bootstrap is down
+  sig(to, s) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s }));
+    } else if (this._relayPeer && this.peers.has(this._relayPeer)) {
+      // Bootstrap down — relay signal through a connected peer
+      this.sendTo(this._relayPeer, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
+    } else {
+      // Try any connected peer as relay
+      for (const [pid] of this.peers) {
+        this.sendTo(pid, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
+        return;
+      }
+    }
   }
 }
