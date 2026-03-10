@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meshchat-v1.1';
+const CACHE_NAME = 'meshchat-v1.1.2';
 const ASSETS = [
   './',
   './index.html',

@@ -30,6 +30,9 @@ class Node {
     this.pins = {}; // channel -> [msgId, ...]
     this.broadcastChannels = new Set(); // channels in broadcast mode
     this.readReceipts = new Map(); // msgId -> { delivered: bool, read: bool }
+    this.relayPeers = new Map(); // targetId -> relayPeerId
+    this._relayCount = 0; // rate limit counter
+    this._relayResetTimer = null;
   }
 
   async init(name) {
@@ -206,7 +209,7 @@ class Node {
     this._status = s;
     const tag = document.getElementById('statusTag');
     if (!tag) return;
-    tag.textContent = 'v1.1';
+    tag.textContent = 'v1.1.2';
     if (s === 'connected') tag.className = 'tag tag-on';
     else if (s === 'reconnecting') tag.className = 'tag tag-warn';
     else tag.className = 'tag tag-off';
@@ -1268,9 +1271,9 @@ class Node {
   }
 
   // Admin: manage ads
-  adminAddAd(text, link) {
+  adminAddAd(text, link, adType, placement, scriptCode) {
     if (!this.mod.isAdmin) return;
-    this.mod.addAd(text, link, this.id);
+    this.mod.addAd(text, link, this.id, adType, placement, scriptCode);
     this._broadcastAds();
   }
 
@@ -1704,47 +1707,66 @@ class Node {
   // ═══ P2P SIGNALING RELAY ═══
   // When bootstrap is down, peers relay signaling for each other
 
+  // Rate limit check for relay
+  _canRelay() {
+    if (this._relayCount >= 5) return false; // max 5 relay/sec
+    this._relayCount++;
+    if (!this._relayResetTimer) {
+      this._relayResetTimer = setTimeout(() => { this._relayCount = 0; this._relayResetTimer = null; }, 1000);
+    }
+    return true;
+  }
+
   // Someone asks us to relay their signaling to a target peer
   _onRelayRequest(d, from) {
     if (!d.targetId || !d.fromId) return;
-    // If we're connected to the target, forward the request
+    if (!this._canRelay()) return; // rate limit
     if (this.peers.has(d.targetId)) {
       this.sendTo(d.targetId, { type: 'signal-relay', signal: { type: 'relay-offer', fromId: d.fromId, fromName: d.fromName }, relayedBy: this.id });
-      console.log(`Relaying signal request from ${d.fromName || d.fromId.slice(0,8)} to ${d.targetId.slice(0,8)}`);
+      console.log(`Relaying: ${(d.fromName || d.fromId).slice(0,8)} → ${d.targetId.slice(0,8)}`);
     }
   }
 
-  // Receive a relayed signal — start connection
+  // Receive a relayed signal — start connection or forward SDP/ICE
   _onRelaySignal(d, from) {
     if (!d.signal) return;
     const sig = d.signal;
     if (sig.type === 'relay-offer' && sig.fromId) {
-      // Someone wants to connect to us via relay — initiate connection through relay
       if (!this.peers.has(sig.fromId) && !this.pending.has(sig.fromId)) {
-        console.log(`Relay connection from ${sig.fromName || sig.fromId.slice(0,8)} via ${from.slice(0,8)}`);
-        // Start connection but use relay peer for signaling instead of bootstrap
-        this._relayPeer = from;
+        console.log(`Relay offer from ${(sig.fromName || sig.fromId).slice(0,8)} via ${from.slice(0,8)}`);
+        this.relayPeers.set(sig.fromId, from); // remember who relays for this target
         this.startConn(sig.fromId, sig.fromName || 'peer');
       }
     } else if (sig.sdp || sig.candidate) {
-      // Relayed ICE/SDP — forward to pending connection
+      // Relayed ICE/SDP
       const target = sig.targetId || sig.from;
-      if (target) this.onSig({ signal: sig, from: target, fromName: sig.fromName });
+      if (target) {
+        // Are we the relay? Forward to target
+        if (this.peers.has(target)) {
+          this.sendTo(target, { type: 'signal-relay', signal: sig });
+        } else {
+          // We're the destination — process the signal
+          this.onSig({ signal: sig, from: target, fromName: sig.fromName });
+        }
+      }
     }
   }
 
-  // Override sig() to use relay when bootstrap is down
+  // sig() — send signaling via bootstrap or relay
   sig(to, s) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s }));
-    } else if (this._relayPeer && this.peers.has(this._relayPeer)) {
-      // Bootstrap down — relay signal through a connected peer
-      this.sendTo(this._relayPeer, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
     } else {
-      // Try any connected peer as relay
-      for (const [pid] of this.peers) {
-        this.sendTo(pid, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
-        return;
+      // Bootstrap down — use relay
+      const relay = this.relayPeers.get(to);
+      if (relay && this.peers.has(relay)) {
+        this.sendTo(relay, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
+      } else {
+        // Try any connected peer as relay
+        for (const [pid] of this.peers) {
+          this.sendTo(pid, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
+          return;
+        }
       }
     }
   }

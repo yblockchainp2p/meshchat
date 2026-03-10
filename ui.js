@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1
+// 8. UI RENDERING — MeshChat v1.1.2
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -536,6 +536,27 @@ function renderChannel() {
   el.appendChild = origAppend;
   el.appendChild(frag);
   el.scrollTop = el.scrollHeight;
+
+  // Inject script ads into pending image placeholders
+  el.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
+    try {
+      const code = atob(slot.dataset.adscript);
+      const container = document.createElement('div');
+      container.innerHTML = code;
+      // Execute script tags
+      container.querySelectorAll('script').forEach(oldScript => {
+        const newScript = document.createElement('script');
+        if (oldScript.src) newScript.src = oldScript.src;
+        else newScript.textContent = oldScript.textContent;
+        slot.appendChild(newScript);
+      });
+      // Append non-script content
+      while (container.firstChild) {
+        if (container.firstChild.nodeName !== 'SCRIPT') slot.appendChild(container.firstChild);
+        else container.removeChild(container.firstChild);
+      }
+    } catch (e) { console.error('Ad inject:', e); }
+  });
 }
 
 // ═══ CHANNEL LIST ═══
@@ -989,25 +1010,43 @@ function refreshAdmin() {
     }
 
     // ── AD MANAGEMENT ──
-    html += '<div class="ch-section">📢 Ads (shown during media review)</div>';
+    html += '<div class="ch-section">📢 Ads</div>';
     html += `<div style="padding:6px 8px;">
-      <div style="display:flex;gap:4px;margin-bottom:6px;">
-        <input id="adText" class="ch-new-input" placeholder="Ad text..." style="flex:2;">
-        <input id="adLink" class="ch-new-input" placeholder="Link (optional)" style="flex:2;">
-        <button class="admin-btn" id="adAdd" style="white-space:nowrap;">+</button>
+      <div style="display:flex;gap:4px;margin-bottom:4px;">
+        <select id="adType" class="ch-new-input" style="flex:1;font-size:10px;padding:4px;">
+          <option value="text">Text</option>
+          <option value="script">Script</option>
+          <option value="banner">Banner</option>
+          <option value="html">HTML</option>
+        </select>
+        <select id="adPlacement" class="ch-new-input" style="flex:1;font-size:10px;padding:4px;">
+          <option value="pending_image">Pending Image</option>
+          <option value="plaza_feed">Plaza Feed</option>
+          <option value="sidebar">Sidebar</option>
+        </select>
       </div>
+      <div style="display:flex;gap:4px;margin-bottom:4px;">
+        <input id="adText" class="ch-new-input" placeholder="Text / Image URL..." style="flex:2;">
+        <input id="adLink" class="ch-new-input" placeholder="Link (optional)" style="flex:2;">
+      </div>
+      <textarea id="adScript" class="ch-new-input" placeholder="Script/HTML code (for script/html type)" rows="2" style="font-size:9px;font-family:var(--mono);display:none;margin-bottom:4px;"></textarea>
+      <button class="admin-btn" id="adAdd" style="width:100%;">+ Add Ad</button>
     </div>`;
     const ads = N.mod.customAds;
     if (ads.length) {
       for (let i = 0; i < ads.length; i++) {
         const a = ads[i];
-        html += `<div style="display:flex;align-items:center;gap:6px;padding:3px 8px;font-size:10px;">
-          <span style="flex:1;color:var(--cyan);">${esc(a.text)}${a.link ? ` → ${esc(a.link).slice(0, 30)}` : ''}</span>
+        const typeIcon = a.adType === 'script' ? '⚡' : a.adType === 'banner' ? '🖼️' : a.adType === 'html' ? '📄' : '📝';
+        const placeBadge = (a.placement || 'pending_image').replace('_', ' ');
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:4px 8px;font-size:10px;border-bottom:1px solid var(--brd);">
+          <span style="opacity:0.6;">${typeIcon}</span>
+          <span style="flex:1;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc((a.text || a.scriptCode || '').slice(0, 40))}</span>
+          <span style="font-size:8px;color:var(--t3);background:var(--bg3);padding:1px 4px;border-radius:3px;">${placeBadge}</span>
           <span class="ad-del" data-adi="${i}" style="cursor:pointer;color:var(--t3);font-size:12px;">×</span>
         </div>`;
       }
     } else {
-      html += '<div class="empty" style="padding:6px;">Using default ads</div>';
+      html += '<div class="empty" style="padding:6px;">No ads configured</div>';
     }
   }
 
@@ -1034,10 +1073,19 @@ function refreshAdmin() {
   el.querySelectorAll('.bw-del').forEach(btn => {
     btn.addEventListener('click', () => { N.adminRemoveBannedWord(parseInt(btn.dataset.bwi)); refreshAdmin(); });
   });
+  document.getElementById('adType')?.addEventListener('change', (e) => {
+    const sa = document.getElementById('adScript');
+    if (sa) sa.style.display = (e.target.value === 'script' || e.target.value === 'html') ? '' : 'none';
+  });
   document.getElementById('adAdd')?.addEventListener('click', () => {
     const t = document.getElementById('adText')?.value?.trim();
     const l = document.getElementById('adLink')?.value?.trim();
-    if (t) { N.adminAddAd(t, l || ''); refreshAdmin(); }
+    const adType = document.getElementById('adType')?.value || 'text';
+    const placement = document.getElementById('adPlacement')?.value || 'pending_image';
+    const scriptCode = document.getElementById('adScript')?.value?.trim();
+    if (!t && !scriptCode) return;
+    N.adminAddAd(t || '', l || '', adType, placement, scriptCode || '');
+    refreshAdmin();
   });
   el.querySelectorAll('.ad-del').forEach(btn => {
     btn.addEventListener('click', () => { N.adminRemoveAd(parseInt(btn.dataset.adi)); refreshAdmin(); });

@@ -790,9 +790,15 @@ class ModerationEngine {
   canModerate(nodeId) { return this.admins.has(nodeId) || this.mods.has(nodeId); }
 
   // ── CUSTOM ADS (admin-managed) ──
-  addAd(text, link, adminId) {
-    if (!text) return;
-    this.customAds.push({ text, link: link || '', addedBy: adminId, ts: Date.now() });
+  // Types: text, script (JS injection), banner (image+link), html (raw HTML)
+  // Placements: pending_image, plaza_feed, sidebar
+  addAd(text, link, adminId, adType, placement, scriptCode) {
+    this.customAds.push({
+      text: text || '', link: link || '', addedBy: adminId, ts: Date.now(),
+      adType: adType || 'text',
+      placement: placement || 'pending_image',
+      scriptCode: scriptCode || '',
+    });
     DB.setKey('mod:ads', this.customAds);
   }
 
@@ -803,12 +809,16 @@ class ModerationEngine {
     }
   }
 
-  getAdPlaceholder() {
-    if (this.customAds.length) {
-      const ad = this.customAds[Math.floor(Math.random() * this.customAds.length)];
-      return ad.link ? `<a href="${ad.link}" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none;">${ad.text}</a>` : ad.text;
-    }
-    return '⏳ Media is being reviewed by admin...';
+  getAdPlaceholder(placement) {
+    const target = placement || 'pending_image';
+    const pool = this.customAds.filter(a => (a.placement || 'pending_image') === target);
+    const ad = pool.length ? pool[Math.floor(Math.random() * pool.length)]
+      : this.customAds.length ? this.customAds[Math.floor(Math.random() * this.customAds.length)] : null;
+    if (!ad) return '⏳ Media is being reviewed by admin...';
+    if (ad.adType === 'script') return `<div class="ad-script-slot" data-adscript="${btoa(ad.scriptCode || ad.text)}"><span style="font-size:9px;color:var(--t3);">Sponsored</span></div>`;
+    if (ad.adType === 'banner') return `<a href="${ad.link || '#'}" target="_blank" rel="noopener sponsored" style="display:block;"><img src="${ad.text}" style="max-width:100%;border-radius:6px;" alt="Ad"></a>`;
+    if (ad.adType === 'html') return `<div class="ad-html-slot">${ad.scriptCode || ad.text}</div>`;
+    return ad.link ? `<a href="${ad.link}" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none;">${ad.text}</a>` : ad.text;
   }
 
   getAdsPacket() { return this.customAds; }
