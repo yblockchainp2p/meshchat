@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1.2
+// 8. UI RENDERING — MeshChat v1.1.3
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -591,18 +591,20 @@ function _showChannelAd() {
   const el = document.getElementById('msgs');
   if (!el) return;
   const adContent = N.mod.getAdPlaceholder('sidebar');
-  if (!adContent) return; // no ads configured — don't show anything
+  if (!adContent) return;
   
+  const isScript = adContent.includes('ad-script-slot');
   const adMsg = document.createElement('div');
   adMsg.className = 'm m-sys channel-ad-msg';
-  adMsg.style.display = 'none'; // hidden until ad loads
+  if (isScript) adMsg.style.display = 'none';
   adMsg.innerHTML = `<div class="mb" style="text-align:center;">
     <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
     <div class="ad-inject-zone">${adContent}</div>
   </div>`;
   el.appendChild(adMsg);
+  if (!isScript) el.scrollTop = el.scrollHeight;
 
-  // Inject scripts if any
+  // Inject scripts
   adMsg.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
     try {
       const code = atob(slot.dataset.adscript);
@@ -616,23 +618,15 @@ function _showChannelAd() {
     } catch (_) {}
   });
 
-  // Show after 3s only if ad loaded, otherwise remove
-  setTimeout(() => {
-    const zone = adMsg.querySelector('.ad-inject-zone');
-    const hasContent = zone && (zone.querySelector('iframe, img, a, ins, [id]') || zone.children.length > 1);
-    if (hasContent) {
-      adMsg.style.display = '';
-      el.scrollTop = el.scrollHeight;
-    } else {
-      // For non-script ads (text, banner), show immediately
-      if (adContent && !adContent.includes('ad-script-slot')) {
-        adMsg.style.display = '';
-        el.scrollTop = el.scrollHeight;
-      } else {
-        adMsg.remove();
-      }
-    }
-  }, 3000);
+  // Only script ads need delayed check
+  if (isScript) {
+    setTimeout(() => {
+      const zone = adMsg.querySelector('.ad-inject-zone');
+      const hasContent = zone && (zone.querySelector('iframe, img, ins, [id]') || zone.children.length > 1);
+      if (hasContent) { adMsg.style.display = ''; el.scrollTop = el.scrollHeight; }
+      else adMsg.remove();
+    }, 3000);
+  }
 }
 
 // ═══ CHANNEL LIST ═══
@@ -1896,7 +1890,9 @@ function refreshPlazaFeed() {
   const makeAdHtml = () => {
     const adContent = N.mod.getAdPlaceholder('plaza_feed');
     if (!adContent) return '';
-    return `<div class="plaza-ad-slot" style="padding:12px;border-bottom:1px solid var(--brd);text-align:center;display:none;" data-adslot="1">
+    // Text/banner/html ads show immediately, script ads start hidden
+    const isScript = adContent.includes('ad-script-slot');
+    return `<div class="plaza-ad-slot" style="padding:12px;border-bottom:1px solid var(--brd);text-align:center;${isScript ? 'display:none;' : ''}" data-adslot="${isScript ? 'script' : 'static'}">
       <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
       <div class="ad-inject-zone">${adContent}</div>
     </div>`;
@@ -1925,7 +1921,18 @@ function refreshPlazaFeed() {
     const liked = p.likes?.includes(N.id);
     const likeCount = p.likes?.length || 0;
     const badges = getBadgeHtml(p.senderId);
-    const imgHtml = p.image ? `<div class="plaza-post-img"><img src="${p.image}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;"></div>` : '';
+    // Image: check cache first, then show thumb
+    let imgHtml = '';
+    if (p.image) {
+      imgHtml = `<div class="plaza-post-img"><img src="${p.image}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;"></div>`;
+    } else if (p.imageId) {
+      const cached = window._fileUrls?.[p.imageId];
+      if (cached) {
+        imgHtml = `<div class="plaza-post-img"><img src="${cached.url}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;"></div>`;
+      } else if (p.thumb) {
+        imgHtml = `<div class="plaza-post-img plaza-img-load" data-imgid="${esc(p.imageId)}"><img src="${p.thumb}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;opacity:0.7;cursor:pointer;"><div style="font-size:9px;color:var(--t3);text-align:center;">Tap to load full image</div></div>`;
+      }
+    }
     html += `<div class="live-post" data-postid="${esc(p.id)}">
       <div class="live-post-header">
         <div class="live-post-avatar" style="${avatarStyle}">${hasAvatar ? '' : emoji}</div>
@@ -1983,12 +1990,22 @@ function refreshPlazaFeed() {
       refreshPlazaFeed();
     });
   });
+  // Plaza image tap → request from P2P network
+  el.querySelectorAll('.plaza-img-load').forEach(div => {
+    div.addEventListener('click', () => {
+      const imgId = div.dataset.imgid;
+      div.querySelector('div')?.remove(); // remove "tap to load" text
+      div.innerHTML = '<div style="padding:8px;text-align:center;font-size:10px;color:var(--cyan);">⏳ Loading...</div>';
+      N.requestFile(imgId);
+    });
+  });
   // Inject script ads in plaza
   _injectPlazaAds(el);
 }
 
 // Inject script-type ads into ad slots, show on load, remove if empty after 3s
 function _injectPlazaAds(container) {
+  // Inject script tags
   container.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
     try {
       const code = atob(slot.dataset.adscript);
@@ -2001,19 +2018,16 @@ function _injectPlazaAds(container) {
       });
     } catch (_) {}
   });
-  // Show ad slots that have real content, hide/remove empty ones after 3s
-  container.querySelectorAll('[data-adslot]').forEach(slot => {
-    // Check after 3 seconds if ad actually loaded
+  // Only script ad slots need delayed visibility check
+  container.querySelectorAll('[data-adslot="script"]').forEach(slot => {
     setTimeout(() => {
       const zone = slot.querySelector('.ad-inject-zone');
-      const hasContent = zone && (zone.querySelector('iframe, img, a, ins, [id]') || zone.children.length > 1);
-      if (hasContent) {
-        slot.style.display = '';
-      } else {
-        slot.remove(); // no ad loaded — remove entirely
-      }
+      const hasContent = zone && (zone.querySelector('iframe, img, ins, [id]') || zone.children.length > 1);
+      if (hasContent) slot.style.display = '';
+      else slot.remove();
     }, 3000);
   });
+  // Static ad slots are already visible — no action needed
 }
 
 function timeAgo(ts) {

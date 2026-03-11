@@ -209,7 +209,7 @@ class Node {
     this._status = s;
     const tag = document.getElementById('statusTag');
     if (!tag) return;
-    tag.textContent = 'v1.1.2';
+    tag.textContent = 'v1.1.3';
     if (s === 'connected') tag.className = 'tag tag-on';
     else if (s === 'reconnecting') tag.className = 'tag tag-warn';
     else tag.className = 'tag tag-off';
@@ -373,32 +373,52 @@ class Node {
 
   // ── DELETE / EDIT MESSAGES ──
   async deleteMessage(msgId) {
-    // Only delete own messages
     const all = this.store.getAll();
     const msg = all.find(m => m.msgId === msgId);
-    if (!msg || msg.senderId !== this.id) return;
+    if (!msg) return;
+    // Allow own messages OR admin/mod can delete anyone's
+    if (msg.senderId !== this.id && !this.mod.isAdmin && !this.mod.isMod) return;
+    // Clean up file cache if it's an image
+    if (msg.fileMeta?.transferId) {
+      this.ft.fileCache.delete(msg.fileMeta.transferId);
+      this.ft.outgoing.delete(msg.fileMeta.transferId);
+      if (window._fileUrls?.[msg.fileMeta.transferId]) {
+        URL.revokeObjectURL(window._fileUrls[msg.fileMeta.transferId].url);
+        delete window._fileUrls[msg.fileMeta.transferId];
+      }
+    }
     this.store.deleteMsg(msgId);
-    // Broadcast delete (signed so others trust it)
-    const d = { type: 'delete-msg', msgId, senderId: this.id, ts: Date.now() };
+    this.reactions.delete(msgId);
+    const d = { type: 'delete-msg', msgId, senderId: this.id, deletedBy: this.id, ts: Date.now() };
     d.sig = await this.crypto.sign(d);
     for (const [pid] of this.peers) this.sendTo(pid, d);
     scheduleRender();
   }
 
   onDeleteMsg(d, from) {
-    if (!d.msgId || !d.senderId) return;
-    // Verify sender owns the message
+    if (!d.msgId) return;
     const msg = this.store.getAll().find(m => m.msgId === d.msgId);
-    if (msg && msg.senderId === d.senderId) {
-      this.store.deleteMsg(d.msgId);
-      this.reactions.delete(d.msgId);
-      // Forward
-      const fwd = { ...d, hops: (d.hops || 0) + 1 };
-      if ((fwd.hops || 0) < CFG.TTL) {
-        for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
+    if (!msg) return;
+    // Allow if sender deletes own OR admin/mod deletes
+    const isOwner = msg.senderId === d.senderId;
+    const isAdminDelete = this.mod.admins.has(d.deletedBy) || this.mod.mods.has(d.deletedBy);
+    if (!isOwner && !isAdminDelete) return;
+    // Clean up file
+    if (msg.fileMeta?.transferId) {
+      this.ft.fileCache.delete(msg.fileMeta.transferId);
+      this.ft.outgoing.delete(msg.fileMeta.transferId);
+      if (window._fileUrls?.[msg.fileMeta.transferId]) {
+        URL.revokeObjectURL(window._fileUrls[msg.fileMeta.transferId].url);
+        delete window._fileUrls[msg.fileMeta.transferId];
       }
-      renderChannel();
     }
+    this.store.deleteMsg(d.msgId);
+    this.reactions.delete(d.msgId);
+    const fwd = { ...d, hops: (d.hops || 0) + 1 };
+    if ((fwd.hops || 0) < CFG.TTL) {
+      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
+    }
+    renderChannel();
   }
 
   async editMessage(msgId, newText) {
@@ -1644,14 +1664,43 @@ class Node {
     if (!text?.trim() && !imageDataUrl) return;
     const postId = `post-${this.id.slice(0,8)}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
     const post = { id: postId, senderId: this.id, senderName: this.name, text: (text || '').trim().slice(0, 500), ts: Date.now(), likes: [] };
-    // Attach image as thumbnail (max 100KB base64 for P2P gossip)
-    if (imageDataUrl) post.image = imageDataUrl;
+    if (imageDataUrl) {
+      // Generate tiny thumbnail for gossip (~10KB), store full image in cache
+      const fileId = `plaza-${postId}`;
+      post.imageId = fileId;
+      post.thumb = imageDataUrl; // compressImage already made this small (400px, 70%)
+      // Cache full image so we can serve it to peers
+      try {
+        const binary = atob(imageDataUrl.split(',')[1]);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        const meta = { transferId: fileId, fileName: 'plaza-image.jpg', fileSize: bytes.length, fileType: 'image/jpeg', totalChunks: Math.ceil(bytes.length / 16384), thumb: '' };
+        this.ft.fileCache.set(fileId, { blob, meta });
+        this.ft._cacheToDB(fileId, bytes, meta);
+        // Prepare chunks for serving
+        const chunks = [];
+        for (let i = 0; i < meta.totalChunks; i++) {
+          const start = i * 16384;
+          const end = Math.min(start + 16384, bytes.length);
+          chunks.push(btoa(String.fromCharCode(...bytes.slice(start, end))));
+        }
+        this.ft.outgoing.set(fileId, { meta, chunks });
+      } catch (_) {
+        // Fallback: keep full image in post (old behavior)
+        post.image = imageDataUrl;
+      }
+    }
     this.profile.posts.push(post);
     if (this.profile.posts.length > 200) this.profile.posts = this.profile.posts.slice(-200);
     DB.setKey('profile', this.profile);
-    // Broadcast (image included — compressed thumbnail)
+    // Broadcast — only thumb in gossip, not full image
+    const gossipPost = { ...post };
+    delete gossipPost.image; // don't gossip full image
     for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'social-post', post, hops: 0 });
+      this.sendTo(pid, { type: 'social-post', post: gossipPost, hops: 0 });
+      // Announce we can seed this image
+      if (post.imageId) this.sendTo(pid, { type: 'file-have', transferId: post.imageId, seederId: this.id });
     }
     if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
   }
@@ -1660,12 +1709,13 @@ class Node {
     if (!d.post?.id || !d.post.senderId) return;
     const p = this.peerProfiles.get(d.post.senderId) || { posts: [] };
     if (!p.posts) p.posts = [];
-    if (p.posts.some(x => x.id === d.post.id)) return; // dedup
+    if (p.posts.some(x => x.id === d.post.id)) return;
     p.posts.push(d.post);
     if (p.posts.length > 200) p.posts = p.posts.slice(-200);
     p.name = d.post.senderName;
     this.peerProfiles.set(d.post.senderId, p);
-    // Gossip forward
+    // Track seeder
+    if (d.post.imageId) this.ft.addSeeder(d.post.imageId, d.post.senderId);
     if ((d.hops || 0) < 3) {
       for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, { ...d, hops: (d.hops || 0) + 1 }); }
     }
