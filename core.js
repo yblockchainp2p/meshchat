@@ -7,7 +7,7 @@ const BOOTSTRAP = 'wss://meshchat-bootstrap.onrender.com';
 const CFG = {
   K: 20, ALPHA: 3, MAX_PEERS: 20, FANOUT: 6, TTL: 10,
   MSG_CACHE: 2000, HISTORY: 100, HB: 15000, TIMEOUT: 45000, REFRESH: 60000,
-  DB_NAME: 'meshchat', DB_VER: 2,
+  DB_NAME: 'meshchat', DB_VER: 3,
 };
 
 // ═══════════════════════════════════════
@@ -137,6 +137,7 @@ const DB = {
         }
         if (!db.objectStoreNames.contains('channels')) db.createObjectStore('channels', { keyPath: 'name' });
         if (!db.objectStoreNames.contains('peers')) db.createObjectStore('peers', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('fileCache')) db.createObjectStore('fileCache', { keyPath: 'id' });
       };
       req.onsuccess = (e) => { DB.db = e.target.result; resolve(); };
       req.onerror = (e) => { console.error('DB error:', e); resolve(); }; // Don't block on DB failure
@@ -814,8 +815,12 @@ class ModerationEngine {
     const pool = this.customAds.filter(a => (a.placement || 'pending_image') === target);
     const ad = pool.length ? pool[Math.floor(Math.random() * pool.length)]
       : this.customAds.length ? this.customAds[Math.floor(Math.random() * this.customAds.length)] : null;
-    if (!ad) return '⏳ Media is being reviewed by admin...';
-    if (ad.adType === 'script') return `<div class="ad-script-slot" data-adscript="${btoa(ad.scriptCode || ad.text)}"><span style="font-size:9px;color:var(--t3);">Sponsored</span></div>`;
+    if (!ad) {
+      // No ads configured — only show fallback for pending_image
+      if (target === 'pending_image') return '⏳ Media is being reviewed by admin...';
+      return null; // No ad to show for plaza/sidebar
+    }
+    if (ad.adType === 'script') return `<div class="ad-script-slot" data-adscript="${btoa(ad.scriptCode || ad.text)}"></div>`;
     if (ad.adType === 'banner') return `<a href="${ad.link || '#'}" target="_blank" rel="noopener sponsored" style="display:block;"><img src="${ad.text}" style="max-width:100%;border-radius:6px;" alt="Ad"></a>`;
     if (ad.adType === 'html') return `<div class="ad-html-slot">${ad.scriptCode || ad.text}</div>`;
     return ad.link ? `<a href="${ad.link}" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none;">${ad.text}</a>` : ad.text;
@@ -969,18 +974,20 @@ class ModerationEngine {
 // 9. FILE TRANSFER (P2P chunked)
 // ═══════════════════════════════════════
 const FILE_CFG = {
-  CHUNK_SIZE: 16384,   // 16KB per chunk (WebRTC friendly)
-  MAX_SIZE: 10 * 1024 * 1024, // 10MB max
-  THUMB_MAX: 200,      // Thumbnail max dimension
+  CHUNK_SIZE: 16384,
+  MAX_SIZE: 10 * 1024 * 1024,
+  THUMB_MAX: 150,        // smaller thumbnail for gossip efficiency
+  THUMB_QUALITY: 0.4,    // more aggressive compression
 };
 
 class FileTransfer {
   constructor() {
-    this.incoming = new Map(); // transferId -> { chunks[], meta, received }
+    this.incoming = new Map();
     this.outgoing = new Map();
+    this.fileCache = new Map();  // transferId -> { blob, meta } (completed files)
+    this.seeders = new Map();    // transferId -> Set(peerId) — who has this file
   }
 
-  // Create a file message with metadata
   async prepareFile(file) {
     if (file.size > FILE_CFG.MAX_SIZE) {
       return { error: `File too large (max ${FILE_CFG.MAX_SIZE / 1024 / 1024}MB)` };
@@ -990,60 +997,44 @@ class FileTransfer {
     const data = new Uint8Array(buffer);
     const totalChunks = Math.ceil(data.length / FILE_CFG.CHUNK_SIZE);
 
-    // Generate thumbnail for images
     let thumb = '';
     if (file.type.startsWith('image/')) {
       thumb = await this.makeThumbnail(file);
     }
 
-    const meta = {
-      transferId,
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
-      totalChunks,
-      thumb, // base64 thumbnail for preview
-    };
-
-    // Store chunks for sending
+    const meta = { transferId, fileName: file.name, fileSize: file.size, fileType: file.type, totalChunks, thumb };
     const chunks = [];
     for (let i = 0; i < totalChunks; i++) {
       const start = i * FILE_CFG.CHUNK_SIZE;
       const end = Math.min(start + FILE_CFG.CHUNK_SIZE, data.length);
       const chunk = data.slice(start, end);
-      // Convert to base64 for JSON transport
       chunks.push(btoa(String.fromCharCode(...chunk)));
     }
     this.outgoing.set(transferId, { meta, chunks });
+
+    // Cache our own file immediately
+    const blob = new Blob([data], { type: file.type });
+    this.fileCache.set(transferId, { blob, meta });
+    this._cacheToDB(transferId, data, meta);
+
     return { meta, chunks };
   }
 
-  // Receive a chunk
   receiveChunk(transferId, chunkIndex, chunkData, meta) {
     if (!this.incoming.has(transferId)) {
-      this.incoming.set(transferId, {
-        meta,
-        chunks: new Array(meta.totalChunks).fill(null),
-        received: 0,
-      });
+      this.incoming.set(transferId, { meta, chunks: new Array(meta.totalChunks).fill(null), received: 0 });
     }
     const transfer = this.incoming.get(transferId);
     if (!transfer.chunks[chunkIndex]) {
       transfer.chunks[chunkIndex] = chunkData;
       transfer.received++;
     }
-    return {
-      complete: transfer.received === transfer.meta.totalChunks,
-      progress: transfer.received / transfer.meta.totalChunks,
-    };
+    return { complete: transfer.received === transfer.meta.totalChunks, progress: transfer.received / transfer.meta.totalChunks };
   }
 
-  // Assemble completed file
   assembleFile(transferId) {
     const transfer = this.incoming.get(transferId);
     if (!transfer || transfer.received !== transfer.meta.totalChunks) return null;
-
-    // Decode all chunks from base64 and concatenate
     const parts = [];
     for (const chunk of transfer.chunks) {
       const binary = atob(chunk);
@@ -1055,13 +1046,82 @@ class FileTransfer {
     const result = new Uint8Array(totalLen);
     let offset = 0;
     for (const p of parts) { result.set(p, offset); offset += p.length; }
-
     const blob = new Blob([result], { type: transfer.meta.fileType });
+
+    // Cache the completed file — we are now a seeder
+    this.fileCache.set(transferId, { blob, meta: transfer.meta });
+    this._cacheToDB(transferId, result, transfer.meta);
+
+    // Re-chunk for outgoing (so we can serve to others)
+    const chunks = [];
+    for (let i = 0; i < transfer.meta.totalChunks; i++) {
+      chunks.push(transfer.chunks[i]);
+    }
+    this.outgoing.set(transferId, { meta: transfer.meta, chunks });
+
     this.incoming.delete(transferId);
     return { blob, meta: transfer.meta };
   }
 
-  // Generate thumbnail for images
+  // Check if we have this file (can seed)
+  hasFile(transferId) {
+    return this.fileCache.has(transferId) || this.outgoing.has(transferId);
+  }
+
+  // Get chunks to serve to requester
+  getChunks(transferId) {
+    return this.outgoing.get(transferId);
+  }
+
+  // Register a peer as having a file
+  addSeeder(transferId, peerId) {
+    if (!this.seeders.has(transferId)) this.seeders.set(transferId, new Set());
+    this.seeders.get(transferId).add(peerId);
+  }
+
+  // Get peers who have this file
+  getSeeders(transferId) {
+    return this.seeders.get(transferId) || new Set();
+  }
+
+  // Cache file to IndexedDB for persistence
+  async _cacheToDB(transferId, data, meta) {
+    try {
+      if (!DB.db) return;
+      const tx = DB.db.transaction('fileCache', 'readwrite');
+      tx.objectStore('fileCache').put({ id: transferId, data: Array.from(data), meta, ts: Date.now() });
+    } catch (_) {}
+  }
+
+  // Load cached file from IndexedDB
+  async loadFromCache(transferId) {
+    try {
+      if (!DB.db) return null;
+      return new Promise(r => {
+        const tx = DB.db.transaction('fileCache', 'readonly');
+        const req = tx.objectStore('fileCache').get(transferId);
+        req.onsuccess = () => {
+          if (req.result) {
+            const bytes = new Uint8Array(req.result.data);
+            const blob = new Blob([bytes], { type: req.result.meta.fileType });
+            this.fileCache.set(transferId, { blob, meta: req.result.meta });
+            // Also prepare chunks for outgoing
+            const chunks = [];
+            const totalChunks = req.result.meta.totalChunks;
+            for (let i = 0; i < totalChunks; i++) {
+              const start = i * FILE_CFG.CHUNK_SIZE;
+              const end = Math.min(start + FILE_CFG.CHUNK_SIZE, bytes.length);
+              chunks.push(btoa(String.fromCharCode(...bytes.slice(start, end))));
+            }
+            this.outgoing.set(transferId, { meta: req.result.meta, chunks });
+            r({ blob, meta: req.result.meta });
+          } else r(null);
+        };
+        req.onerror = () => r(null);
+      });
+    } catch (_) { return null; }
+  }
+
   async makeThumbnail(file) {
     return new Promise((resolve) => {
       const img = new Image();
@@ -1074,7 +1134,7 @@ class FileTransfer {
         }
         c.width = w; c.height = h;
         c.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(c.toDataURL('image/jpeg', 0.5));
+        resolve(c.toDataURL('image/jpeg', FILE_CFG.THUMB_QUALITY));
       };
       img.onerror = () => resolve('');
       img.src = URL.createObjectURL(file);

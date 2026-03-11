@@ -229,7 +229,7 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
     } else if (fileUrl) {
       fileContent = `<div class="file-dl"><a href="${fileUrl.url}" download="${esc(fileMeta.fileName)}" style="color:var(--cyan);">📥 ${esc(fileMeta.fileName)}</a></div>`;
     } else if (fileMeta.thumb && status === 'approved') {
-      fileContent = `<div class="file-img"><img src="${fileMeta.thumb}" style="opacity:0.7;"></div>`;
+      fileContent = `<div class="file-img file-thumb-click" data-tid="${esc(fileMeta.transferId)}"><img src="${fileMeta.thumb}" style="opacity:0.7;cursor:pointer;" title="Tap to load full image"><div style="font-size:9px;color:var(--t3);text-align:center;">Tap to load</div></div>`;
     }
   }
 
@@ -304,6 +304,16 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   // Hashtag clicks
   d.querySelectorAll('.hashtag').forEach(h => {
     h.addEventListener('click', (e) => { e.preventDefault(); switchChannel(h.dataset.ch); });
+  });
+
+  // Thumbnail click → request full image from P2P swarm
+  d.querySelectorAll('.file-thumb-click').forEach(t => {
+    t.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const tid = t.dataset.tid;
+      t.innerHTML = '<div style="padding:8px;text-align:center;font-size:10px;color:var(--cyan);">⏳ Loading from swarm...</div>';
+      N.requestFile(tid, sender, senderId, channel, msgId);
+    });
   });
 
   // Plaza link click -> switch to Plaza tab
@@ -1785,7 +1795,7 @@ function openStoryCreator() {
   document.getElementById('storyFileIn').addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    compressImage(file, 300, 0.6, (dataUrl) => {
+    compressImage(file, 250, 0.4, (dataUrl) => {
       storyImg = dataUrl;
       document.getElementById('storyImgPreview').style.display = '';
       document.getElementById('storyImgPreview').innerHTML = `<img src="${dataUrl}" style="max-height:120px;border-radius:8px;"><br><span style="font-size:9px;color:var(--t3);cursor:pointer;" id="storyImgRm">✕ Remove</span>`;
@@ -2422,7 +2432,7 @@ document.querySelectorAll('#plazaAttachMenu .attach-item').forEach(item => {
 document.getElementById('plazaFileIn')?.addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  compressImage(file, 400, 0.7, (dataUrl) => {
+  compressImage(file, 300, 0.5, (dataUrl) => {
     _plazaPostImage = dataUrl;
     const prev = document.getElementById('plazaImgPreview');
     prev.style.display = '';

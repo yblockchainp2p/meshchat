@@ -561,3 +561,7 @@ html,body{height:100%;overflow:hidden;font-family:var(--body);background:var(--b
 
 /* ═══ VERSION BADGE ═══ */
 .brand-ver{font-family:var(--mono);font-size:9px;color:var(--t3);margin-left:4px;opacity:0.6;font-weight:400;}
+
+/* Prevent browser image save dialog on long press */
+.file-img img,.plaza-post-img img{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;pointer-events:none;}
+.m{-webkit-touch-callout:none;}

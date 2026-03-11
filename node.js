@@ -601,6 +601,8 @@ class Node {
         pins: this.pins,
         broadcastChannels: [...this.broadcastChannels],
         stories: this._getActiveStories(),
+        // File seeder info — which files we have cached
+        fileHaves: [...this.ft.fileCache.keys()].slice(-100),
       });
 
       // Send history for sync
@@ -614,6 +616,11 @@ class Node {
       // Persist peer info
       DB.savePeer({ id: pid, name: pn, lastSeen: Date.now() });
       this.trust.onConnect(pid);
+
+      // Announce files we can seed (torrent-style distribution)
+      for (const [tid] of this.ft.fileCache) {
+        this.sendTo(pid, { type: 'file-have', transferId: tid, seederId: this.id });
+      }
 
       console.log(`Connected to ${pn}`);
       ui();
@@ -647,6 +654,10 @@ class Node {
       case 'mod-banwords': this.onBanWords(d, from); break;
       case 'file-meta': this.onFileMeta(d, from); break;
       case 'file-chunk': this.onFileChunk(d, from); break;
+      case 'file-have': this._onFileHave(d, from); break;
+      case 'file-request': this._onFileRequest(d, from); break;
+      case 'file-have': this._onFileHave(d, from); break;
+      case 'file-request': this._onFileRequest(d, from); break;
       case 'mod-roles': this.onModRoles(d); break;
       case 'mod-ads': this.onModAds(d, from); break;
       case 'reaction': this.onReaction(d, from); break;
@@ -754,6 +765,13 @@ class Node {
         if (s.senderId && s.ts && s.expiresAt > Date.now()) {
           this.stories.set(s.senderId + '-' + s.ts, s);
         }
+      }
+    }
+
+    // Register peer's file cache as seeders
+    if (Array.isArray(d.fileHaves)) {
+      for (const tid of d.fileHaves) {
+        this.ft.addSeeder(tid, senderId);
       }
     }
 
@@ -1389,13 +1407,89 @@ class Node {
     if (result.complete) {
       const file = this.ft.assembleFile(d.transferId);
       if (file) {
-        // Store blob URL for rendering
         const url = URL.createObjectURL(file.blob);
         window._fileUrls = window._fileUrls || {};
         window._fileUrls[d.transferId] = { url, meta: file.meta };
-        scheduleRender(); // Re-render to show file
+        // We now have this file — announce to ALL peers that we can seed
+        this.ft.addSeeder(d.transferId, this.id);
+        for (const [pid] of this.peers) {
+          this.sendTo(pid, { type: 'file-have', transferId: d.transferId, seederId: this.id });
+        }
+        scheduleRender();
       }
     }
+  }
+
+  // Peer announces they have a file
+  _onFileHave(d, from) {
+    if (!d.transferId || !d.seederId) return;
+    this.ft.addSeeder(d.transferId, d.seederId);
+    // Forward to other peers so everyone knows who has what
+    for (const [pid] of this.peers) {
+      if (pid !== from) this.sendTo(pid, d);
+    }
+  }
+
+  // Someone requests a file we have — serve it
+  _onFileRequest(d, from) {
+    if (!d.transferId) return;
+    const file = this.ft.getChunks(d.transferId);
+    if (!file) return; // we don't have it
+    console.log(`Serving file ${d.transferId.slice(0,8)} to ${from.slice(0,8)}`);
+    // Send meta + all chunks
+    this.sendTo(from, { type: 'file-meta', meta: file.meta, sender: d.originalSender || '', senderId: d.originalSenderId || '', channel: d.channel || '', msgId: d.msgId || '', approved: true });
+    for (let i = 0; i < file.chunks.length; i++) {
+      this.sendTo(from, { type: 'file-chunk', transferId: d.transferId, index: i, data: file.chunks[i], meta: file.meta });
+    }
+  }
+
+  // Request a file from the swarm (any peer who has it)
+  requestFile(transferId, originalSender, originalSenderId, channel, msgId) {
+    // First check if we already have it cached
+    if (window._fileUrls?.[transferId]) return; // already have it
+    if (this.ft.hasFile(transferId)) {
+      // We have it in cache but no URL yet
+      const cached = this.ft.fileCache.get(transferId);
+      if (cached) {
+        const url = URL.createObjectURL(cached.blob);
+        window._fileUrls = window._fileUrls || {};
+        window._fileUrls[transferId] = { url, meta: cached.meta };
+        scheduleRender();
+        return;
+      }
+    }
+
+    // Try to load from IndexedDB cache first
+    this.ft.loadFromCache(transferId).then(cached => {
+      if (cached) {
+        const url = URL.createObjectURL(cached.blob);
+        window._fileUrls = window._fileUrls || {};
+        window._fileUrls[transferId] = { url, meta: cached.meta };
+        scheduleRender();
+        return;
+      }
+
+      // Not cached — request from swarm
+      const seeders = this.ft.getSeeders(transferId);
+      const requestData = { type: 'file-request', transferId, originalSender, originalSenderId, channel, msgId };
+
+      if (seeders.size > 0) {
+        // Ask known seeders first
+        for (const sid of seeders) {
+          if (this.peers.has(sid)) {
+            this.sendTo(sid, requestData);
+            console.log(`Requesting file ${transferId.slice(0,8)} from seeder ${sid.slice(0,8)}`);
+            return;
+          }
+        }
+      }
+
+      // No known seeder online — broadcast request to all peers
+      for (const [pid] of this.peers) {
+        this.sendTo(pid, requestData);
+      }
+      console.log(`Requesting file ${transferId.slice(0,8)} from swarm (${this.peers.size} peers)`);
+    });
   }
 
   // ── History sync ──
@@ -1729,6 +1823,77 @@ class Node {
     const peer = this.peers.get(peerId);
     if (peer && Date.now() - (this.trust.firstSeen?.[peerId] || peer.seen) < 3600 * 1000) badges.push({ icon: '🆕', label: 'New' });
     return badges;
+  }
+
+  // ═══ P2P FILE DISTRIBUTION (torrent-style) ═══
+
+  // A peer announces they have a file
+  _onFileHave(d, from) {
+    if (!d.transferId || !d.seederId) return;
+    this.ft.addSeeder(d.transferId, d.seederId);
+    // Forward announcement (1 hop only)
+    if (!d._forwarded) {
+      for (const [pid] of this.peers) {
+        if (pid !== from) this.sendTo(pid, { ...d, _forwarded: true });
+      }
+    }
+  }
+
+  // A peer requests a file from us
+  _onFileRequest(d, from) {
+    if (!d.transferId) return;
+    const file = this.ft.getChunks(d.transferId);
+    if (file) {
+      // Send meta + all chunks
+      this.sendTo(from, { type: 'file-meta', meta: file.meta, sender: 'cache', senderId: this.id, channel: '', msgId: '', approved: true });
+      for (let i = 0; i < file.chunks.length; i++) {
+        this.sendTo(from, { type: 'file-chunk', transferId: d.transferId, index: i, data: file.chunks[i], meta: file.meta });
+      }
+      console.log(`Seeding ${d.transferId.slice(0, 12)} to ${from.slice(0, 8)}`);
+    }
+  }
+
+  // Request a file — ask seeders or all peers
+  requestFile(transferId) {
+    // Already have it?
+    if (window._fileUrls?.[transferId]) return;
+    if (this.ft.hasFile(transferId)) {
+      const cached = this.ft.fileCache.get(transferId);
+      if (cached) {
+        const url = URL.createObjectURL(cached.blob);
+        window._fileUrls = window._fileUrls || {};
+        window._fileUrls[transferId] = { url, meta: cached.meta };
+        scheduleRender();
+        return;
+      }
+    }
+    // Try loading from IndexedDB cache
+    this.ft.loadFromCache(transferId).then(result => {
+      if (result) {
+        const url = URL.createObjectURL(result.blob);
+        window._fileUrls = window._fileUrls || {};
+        window._fileUrls[transferId] = { url, meta: result.meta };
+        scheduleRender();
+      } else {
+        // Not in cache — request from peers
+        const seeders = this.ft.getSeeders(transferId);
+        if (seeders.size > 0) {
+          // Ask a known seeder
+          for (const sid of seeders) {
+            if (this.peers.has(sid)) {
+              this.sendTo(sid, { type: 'file-request', transferId });
+              console.log(`Requesting ${transferId.slice(0, 12)} from seeder ${sid.slice(0, 8)}`);
+              return;
+            }
+          }
+        }
+        // No known seeders — broadcast request to all peers
+        for (const [pid] of this.peers) {
+          this.sendTo(pid, { type: 'file-request', transferId });
+        }
+        console.log(`Broadcasting file request: ${transferId.slice(0, 12)}`);
+      }
+    });
   }
 
   // ═══ DELETE HANDLERS ═══
