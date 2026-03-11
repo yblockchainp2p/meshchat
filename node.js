@@ -662,6 +662,8 @@ class Node {
       case 'profile-update': this.onProfileUpdate(d, from); break;
       case 'pin': this.onPin(d, from); break;
       case 'social-post': this.onSocialPost(d, from); break;
+      case 'social-post-delete': this._onPostDelete(d, from); break;
+      case 'story-delete': this._onStoryDelete(d, from); break;
       case 'signal-relay-request': this._onRelayRequest(d, from); break;
       case 'signal-relay': this._onRelaySignal(d, from); break;
     }
@@ -1591,6 +1593,31 @@ class Node {
     if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
   }
 
+  // Delete a social post (own or admin)
+  deleteSocialPost(postId, postOwnerId) {
+    if (postOwnerId === this.id) {
+      this.profile.posts = this.profile.posts.filter(p => p.id !== postId);
+      DB.setKey('profile', this.profile);
+    } else if (this.mod.isAdmin || this.mod.isMod) {
+      const prof = this.peerProfiles.get(postOwnerId);
+      if (prof?.posts) prof.posts = prof.posts.filter(p => p.id !== postId);
+    }
+    // Broadcast deletion
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'social-post-delete', postId, postOwnerId, deletedBy: this.id });
+    }
+  }
+
+  // Delete a story (own or admin)
+  deleteStory(storyKey) {
+    this.stories.delete(storyKey);
+    this._saveStories();
+    // Broadcast
+    for (const [pid] of this.peers) {
+      this.sendTo(pid, { type: 'story-delete', storyKey, deletedBy: this.id });
+    }
+  }
+
   // ── Stories ──
   sendStory(text, bgColor, imageDataUrl) {
     if (!text?.trim() && !imageDataUrl) return;
@@ -1702,6 +1729,40 @@ class Node {
     const peer = this.peers.get(peerId);
     if (peer && Date.now() - (this.trust.firstSeen?.[peerId] || peer.seen) < 3600 * 1000) badges.push({ icon: '🆕', label: 'New' });
     return badges;
+  }
+
+  // ═══ DELETE HANDLERS ═══
+  _onPostDelete(d, from) {
+    if (!d.postId) return;
+    let found = false;
+    // Delete from own posts
+    const ownBefore = this.profile.posts.length;
+    this.profile.posts = this.profile.posts.filter(p => p.id !== d.postId);
+    if (this.profile.posts.length < ownBefore) { found = true; DB.setKey('profile', this.profile); }
+    // Delete from ALL peer profiles (search everywhere)
+    for (const [pid, prof] of this.peerProfiles) {
+      if (prof.posts) {
+        const before = prof.posts.length;
+        prof.posts = prof.posts.filter(p => p.id !== d.postId);
+        if (prof.posts.length < before) found = true;
+      }
+    }
+    // Gossip forward to other peers
+    for (const [pid] of this.peers) {
+      if (pid !== from) this.sendTo(pid, d);
+    }
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  _onStoryDelete(d, from) {
+    if (!d.storyKey) return;
+    this.stories.delete(d.storyKey);
+    this._saveStories();
+    // Gossip forward
+    for (const [pid] of this.peers) {
+      if (pid !== from) this.sendTo(pid, d);
+    }
+    ui();
   }
 
   // ═══ P2P SIGNALING RELAY ═══

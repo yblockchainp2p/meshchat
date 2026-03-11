@@ -221,7 +221,7 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
     const status = isMedia ? N.mod.getMediaStatus(fileMeta.transferId) : 'approved';
     const fileUrl = window._fileUrls?.[fileMeta.transferId];
     if (isMedia && status === 'pending') {
-      fileContent = `<div class="file-pending"><div class="file-ad">Loading...</div></div>`;
+      fileContent = `<div class="file-pending"><div class="file-ad">${N.mod.getAdPlaceholder('pending_image')}</div></div>`;
     } else if (isMedia && status === 'rejected') {
       fileContent = `<div class="file-rejected">Media removed</div>`;
     } else if (fileUrl && fileMeta.fileType?.startsWith('image/')) {
@@ -366,6 +366,7 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
       btns += `<div class="action-btn" data-act="bookmark">${isBookmarked ? '★ Unbookmark' : '☆ Bookmark'}</div>`;
       if (self) btns += `<div class="action-btn" data-act="edit">✏ Edit</div>`;
       if (self) btns += `<div class="action-btn" data-act="delete">🗑 Delete</div>`;
+      if (!self && (N.mod.isAdmin || N.mod.isMod)) btns += `<div class="action-btn" data-act="delete">🗑 Delete</div>`;
       if (!self) btns += `<div class="action-btn" data-act="report">⚑ Report</div>`;
       if ((N.mod.isAdmin || N.mod.isMod) && !N.chMgr.isDM(channel)) {
         const isPinned = (N.pins[channel] || []).includes(msgId);
@@ -543,20 +544,85 @@ function renderChannel() {
       const code = atob(slot.dataset.adscript);
       const container = document.createElement('div');
       container.innerHTML = code;
-      // Execute script tags
       container.querySelectorAll('script').forEach(oldScript => {
         const newScript = document.createElement('script');
         if (oldScript.src) newScript.src = oldScript.src;
         else newScript.textContent = oldScript.textContent;
         slot.appendChild(newScript);
       });
-      // Append non-script content
       while (container.firstChild) {
         if (container.firstChild.nodeName !== 'SCRIPT') slot.appendChild(container.firstChild);
         else container.removeChild(container.firstChild);
       }
     } catch (e) { console.error('Ad inject:', e); }
   });
+
+  // Start channel ad timer (5 min interval, per user session)
+  _startChannelAdTimer();
+}
+
+// ═══ CHANNEL AD TIMER ═══
+// Show an ad as the last message every 5 minutes
+let _channelAdTimer = null;
+let _lastChannelAd = 0;
+
+function _startChannelAdTimer() {
+  if (_channelAdTimer) return; // already running
+  _channelAdTimer = setInterval(() => {
+    if (!N.id || !N.mod) return;
+    const now = Date.now();
+    if (now - _lastChannelAd < 5 * 60 * 1000) return; // 5 min cooldown
+    _lastChannelAd = now;
+    _showChannelAd();
+  }, 30000); // check every 30s
+}
+
+function _showChannelAd() {
+  const el = document.getElementById('msgs');
+  if (!el) return;
+  const adContent = N.mod.getAdPlaceholder('sidebar');
+  if (!adContent) return; // no ads configured — don't show anything
+  
+  const adMsg = document.createElement('div');
+  adMsg.className = 'm m-sys channel-ad-msg';
+  adMsg.style.display = 'none'; // hidden until ad loads
+  adMsg.innerHTML = `<div class="mb" style="text-align:center;">
+    <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
+    <div class="ad-inject-zone">${adContent}</div>
+  </div>`;
+  el.appendChild(adMsg);
+
+  // Inject scripts if any
+  adMsg.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
+    try {
+      const code = atob(slot.dataset.adscript);
+      const div = document.createElement('div');
+      div.innerHTML = code;
+      div.querySelectorAll('script').forEach(old => {
+        const s = document.createElement('script');
+        if (old.src) s.src = old.src; else s.textContent = old.textContent;
+        slot.appendChild(s);
+      });
+    } catch (_) {}
+  });
+
+  // Show after 3s only if ad loaded, otherwise remove
+  setTimeout(() => {
+    const zone = adMsg.querySelector('.ad-inject-zone');
+    const hasContent = zone && (zone.querySelector('iframe, img, a, ins, [id]') || zone.children.length > 1);
+    if (hasContent) {
+      adMsg.style.display = '';
+      el.scrollTop = el.scrollHeight;
+    } else {
+      // For non-script ads (text, banner), show immediately
+      if (adContent && !adContent.includes('ad-script-slot')) {
+        adMsg.style.display = '';
+        el.scrollTop = el.scrollHeight;
+      } else {
+        adMsg.remove();
+      }
+    }
+  }, 3000);
 }
 
 // ═══ CHANNEL LIST ═══
@@ -1765,14 +1831,24 @@ function viewStory(senderId) {
       document.body.appendChild(ov);
     }
     ov.style.display = 'flex';
+    const canDelete = s.senderId === N.id || N.mod.isAdmin || N.mod.isMod;
     ov.innerHTML = `
       <div class="story-header"><span class="story-header-name">${esc(s.senderName || '?')}</span><span class="story-header-time">${timeStr}</span></div>
       <span class="story-close" id="storyClose">✕</span>
+      ${canDelete ? `<span id="storyDelete" style="position:absolute;top:16px;right:50px;font-size:14px;color:#f87171;cursor:pointer;z-index:701;">🗑</span>` : ''}
       <div class="story-content" style="background:${s.image ? '#000' : (s.bgColor || '#22d3ee')};color:white;flex-direction:column;gap:12px;">
         ${s.image ? `<img src="${s.image}" style="max-width:100%;max-height:50vh;border-radius:8px;">` : ''}
         ${s.text ? `<div>${esc(s.text)}</div>` : ''}
       </div>`;
     document.getElementById('storyClose').onclick = () => { ov.style.display = 'none'; };
+    document.getElementById('storyDelete')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!confirm('Delete this story?')) return;
+      const key = s.senderId + '-' + s.ts;
+      N.deleteStory(key);
+      ov.style.display = 'none';
+      refreshStories();
+    });
     ov.onclick = (e) => {
       if (e.target === ov || e.target.classList.contains('story-content')) {
         idx++;
@@ -1805,12 +1881,29 @@ function refreshPlazaFeed() {
   }
   allPosts.sort((a, b) => b.ts - a.ts);
 
+  // Ad HTML generator — returns '' if no ads configured
+  // Ad slot starts hidden, becomes visible when script loads content
+  const makeAdHtml = () => {
+    const adContent = N.mod.getAdPlaceholder('plaza_feed');
+    if (!adContent) return '';
+    return `<div class="plaza-ad-slot" style="padding:12px;border-bottom:1px solid var(--brd);text-align:center;display:none;" data-adslot="1">
+      <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
+      <div class="ad-inject-zone">${adContent}</div>
+    </div>`;
+  };
+
   if (!allPosts.length) {
-    el.innerHTML = '<div class="empty" style="padding:20px;font-size:12px;">No posts yet. Be the first to share something!</div>';
+    const adSlot = makeAdHtml();
+    el.innerHTML = `<div class="empty" style="padding:20px;font-size:12px;">No posts yet. Be the first to share!</div>${adSlot}`;
+    if (adSlot) _injectPlazaAds(el);
     return;
   }
 
-  el.innerHTML = allPosts.slice(0, 50).map(p => {
+  // Build posts with ads every 5 posts
+  let html = '';
+  const posts = allPosts.slice(0, 50);
+  for (let i = 0; i < posts.length; i++) {
+    const p = posts[i];
     const c = hue(p.senderName || '?');
     const profile = N.getProfile(p.senderId);
     const emoji = profile.emoji || (p.senderName || '?')[0]?.toUpperCase();
@@ -1822,9 +1915,8 @@ function refreshPlazaFeed() {
     const liked = p.likes?.includes(N.id);
     const likeCount = p.likes?.length || 0;
     const badges = getBadgeHtml(p.senderId);
-    // Image
     const imgHtml = p.image ? `<div class="plaza-post-img"><img src="${p.image}" alt="" style="max-width:100%;border-radius:8px;margin-bottom:6px;"></div>` : '';
-    return `<div class="live-post" data-postid="${esc(p.id)}">
+    html += `<div class="live-post" data-postid="${esc(p.id)}">
       <div class="live-post-header">
         <div class="live-post-avatar" style="${avatarStyle}">${hasAvatar ? '' : emoji}</div>
         <div>
@@ -1838,9 +1930,13 @@ function refreshPlazaFeed() {
         <span class="live-post-action${liked ? ' liked' : ''}" data-postid="${esc(p.id)}" data-owner="${esc(p.senderId)}">${liked ? '❤️' : '🤍'} ${likeCount || ''}</span>
         <span class="live-post-action" data-postshare="${esc(p.id)}" data-shareowner="${esc(p.senderId)}" data-sharename="${esc(p.senderName || '?')}" data-sharetext="${esc((p.text || '').slice(0,60))}">↗ Share</span>
         <span class="live-post-action" data-postcopy="${esc(p.id)}">🔗 Link</span>
+        ${(p.senderId === N.id || N.mod.isAdmin || N.mod.isMod) ? `<span class="live-post-action" data-postdelete="${esc(p.id)}" data-delowner="${esc(p.senderId)}" style="color:var(--red);">🗑</span>` : ''}
       </div>
     </div>`;
-  }).join('');
+    // Insert ad every 5 posts
+    if ((i + 1) % 5 === 0) html += makeAdHtml();
+  }
+  el.innerHTML = html;
 
   // Wire clicks
   el.querySelectorAll('.live-post-name').forEach(n => {
@@ -1868,6 +1964,45 @@ function refreshPlazaFeed() {
       const link = `${base}#plaza/${encodeURIComponent(postId)}`;
       copyLink(link);
     });
+  });
+  // Delete post handler
+  el.querySelectorAll('.live-post-action[data-postdelete]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!confirm('Delete this post?')) return;
+      N.deleteSocialPost(btn.dataset.postdelete, btn.dataset.delowner);
+      refreshPlazaFeed();
+    });
+  });
+  // Inject script ads in plaza
+  _injectPlazaAds(el);
+}
+
+// Inject script-type ads into ad slots, show on load, remove if empty after 3s
+function _injectPlazaAds(container) {
+  container.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
+    try {
+      const code = atob(slot.dataset.adscript);
+      const div = document.createElement('div');
+      div.innerHTML = code;
+      div.querySelectorAll('script').forEach(old => {
+        const s = document.createElement('script');
+        if (old.src) s.src = old.src; else s.textContent = old.textContent;
+        slot.appendChild(s);
+      });
+    } catch (_) {}
+  });
+  // Show ad slots that have real content, hide/remove empty ones after 3s
+  container.querySelectorAll('[data-adslot]').forEach(slot => {
+    // Check after 3 seconds if ad actually loaded
+    setTimeout(() => {
+      const zone = slot.querySelector('.ad-inject-zone');
+      const hasContent = zone && (zone.querySelector('iframe, img, a, ins, [id]') || zone.children.length > 1);
+      if (hasContent) {
+        slot.style.display = '';
+      } else {
+        slot.remove(); // no ad loaded — remove entirely
+      }
+    }, 3000);
   });
 }
 
