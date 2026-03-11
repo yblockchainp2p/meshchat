@@ -1369,7 +1369,14 @@ class Node {
     const lamport = this.clock.tick();
     const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Register media for approval (images/videos need admin approval)
+    // Immediately make file available for own rendering
+    const cached = this.ft.fileCache.get(meta.transferId);
+    if (cached) {
+      window._fileUrls = window._fileUrls || {};
+      window._fileUrls[meta.transferId] = { url: URL.createObjectURL(cached.blob), meta };
+    }
+
+    // Register media for approval (images need admin approval)
     const needsApproval = meta.fileType.startsWith('image/') || meta.fileType.startsWith('video/');
     if (needsApproval) {
       this.mod.registerMedia(meta.transferId, this.name, this.id, ch, meta.thumb);
