@@ -393,17 +393,21 @@ class Node {
     if (msg.senderId !== this.id && !this.mod.isAdmin && !this.mod.isMod) return;
     // Clean up file cache if it's an image
     if (msg.fileMeta?.transferId) {
-      this.ft.fileCache.delete(msg.fileMeta.transferId);
-      this.ft.outgoing.delete(msg.fileMeta.transferId);
-      if (window._fileUrls?.[msg.fileMeta.transferId]) {
-        URL.revokeObjectURL(window._fileUrls[msg.fileMeta.transferId].url);
-        delete window._fileUrls[msg.fileMeta.transferId];
+      const tid = msg.fileMeta.transferId;
+      this.ft.fileCache.delete(tid);
+      this.ft.outgoing.delete(tid);
+      this.mod.approvedMedia.delete(tid);
+      this.mod.rejectedMedia.delete(tid);
+      this.mod.mediaQueue.delete(tid);
+      if (window._fileUrls?.[tid]) {
+        URL.revokeObjectURL(window._fileUrls[tid].url);
+        delete window._fileUrls[tid];
       }
     }
     this.store.deleteMsg(msgId);
     this.reactions.delete(msgId);
     this._addTombstone(msgId, 'msg');
-    const d = { type: 'delete-msg', msgId, senderId: this.id, deletedBy: this.id, ts: Date.now() };
+    const d = { type: 'delete-msg', msgId, senderId: this.id, deletedBy: this.id, ts: Date.now(), transferId: msg.fileMeta?.transferId || null };
     d.sig = await this.crypto.sign(d);
     for (const [pid] of this.peers) this.sendTo(pid, d);
     scheduleRender();
@@ -412,18 +416,31 @@ class Node {
   onDeleteMsg(d, from) {
     if (!d.msgId) return;
     const msg = this.store.getAll().find(m => m.msgId === d.msgId);
-    if (!msg) return;
     // Allow if sender deletes own OR admin/mod deletes
-    const isOwner = msg.senderId === d.senderId;
     const isAdminDelete = this.mod.admins.has(d.deletedBy) || this.mod.mods.has(d.deletedBy);
-    if (!isOwner && !isAdminDelete) return;
-    // Clean up file
-    if (msg.fileMeta?.transferId) {
-      this.ft.fileCache.delete(msg.fileMeta.transferId);
-      this.ft.outgoing.delete(msg.fileMeta.transferId);
-      if (window._fileUrls?.[msg.fileMeta.transferId]) {
-        URL.revokeObjectURL(window._fileUrls[msg.fileMeta.transferId].url);
-        delete window._fileUrls[msg.fileMeta.transferId];
+    if (msg) {
+      const isOwner = msg.senderId === d.senderId;
+      if (!isOwner && !isAdminDelete) return;
+    } else if (!isAdminDelete) {
+      // No message found and not admin delete — just record tombstone and forward
+      this._addTombstone(d.msgId, 'msg');
+      const fwd = { ...d, hops: (d.hops || 0) + 1 };
+      if ((fwd.hops || 0) < CFG.TTL) {
+        for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
+      }
+      return;
+    }
+    // Clean up file — use msg.fileMeta or d.transferId from broadcast
+    const tid = msg?.fileMeta?.transferId || d.transferId;
+    if (tid) {
+      this.ft.fileCache.delete(tid);
+      this.ft.outgoing.delete(tid);
+      this.mod.approvedMedia.delete(tid);
+      this.mod.rejectedMedia.delete(tid);
+      this.mod.mediaQueue.delete(tid);
+      if (window._fileUrls?.[tid]) {
+        try { URL.revokeObjectURL(window._fileUrls[tid].url); } catch (_) {}
+        delete window._fileUrls[tid];
       }
     }
     this.store.deleteMsg(d.msgId);
@@ -642,12 +659,16 @@ class Node {
         tombstones: this._getTombstonePacket(),
       });
 
-      // Send history for sync — filter out tombstoned messages
-      const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel) && !this._isTombstoned(m.msgId));
-      if (history.length) this.sendTo(pid, { type: 'history-sync', messages: history });
+      // IMPORTANT: Delay sync sending to allow peer's handshake (with tombstones) to arrive first
+      // This prevents resurrecting deleted items: we learn what was deleted before sending our data
+      setTimeout(() => {
+        // Send history for sync — filter out tombstoned messages
+        const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel) && !this._isTombstoned(m.msgId));
+        if (history.length) this.sendTo(pid, { type: 'history-sync', messages: history });
 
-      // Send comprehensive social sync — ALL known posts, reactions, likes from all users
-      this._sendSocialSync(pid);
+        // Send comprehensive social sync — ALL known posts, reactions, likes from all users
+        this._sendSocialSync(pid);
+      }, 500);
 
       // If this peer is admin/mod, flush our pending queue to them
       // (small delay so their handshake arrives first and they know they're admin)
@@ -1956,24 +1977,58 @@ class Node {
     }
   }
 
-  // Apply all tombstones — remove deleted items from local data
+  // Apply all tombstones — remove deleted items from local data + files + UI
   _applyTombstones() {
     let changed = false;
     for (const [id, info] of this.tombstones) {
       if (info.type === 'msg') {
+        // Clean up file cache if message had an image
+        const allMsgs = this.store.getAll();
+        const msg = allMsgs.find(m => m.msgId === id);
+        if (msg?.fileMeta?.transferId) {
+          const tid = msg.fileMeta.transferId;
+          this.ft.fileCache.delete(tid);
+          this.ft.outgoing.delete(tid);
+          if (window._fileUrls?.[tid]) {
+            try { URL.revokeObjectURL(window._fileUrls[tid].url); } catch (_) {}
+            delete window._fileUrls[tid];
+          }
+        }
         if (this.store.deleteMsg(id)) changed = true;
         this.reactions.delete(id);
       } else if (info.type === 'post') {
         // Delete from own posts
         const before = this.profile.posts.length;
+        const deletedPost = this.profile.posts.find(p => p.id === id);
         this.profile.posts = this.profile.posts.filter(p => p.id !== id);
         if (this.profile.posts.length < before) changed = true;
+        // Clean up post image cache
+        if (deletedPost?.imageId) {
+          this.ft.fileCache.delete(deletedPost.imageId);
+          this.ft.outgoing.delete(deletedPost.imageId);
+          if (window._fileUrls?.[deletedPost.imageId]) {
+            try { URL.revokeObjectURL(window._fileUrls[deletedPost.imageId].url); } catch (_) {}
+            delete window._fileUrls[deletedPost.imageId];
+          }
+        }
         // Delete from all peer profiles
         for (const [, prof] of this.peerProfiles) {
           if (prof.posts) {
             const pb = prof.posts.length;
+            const peerPost = prof.posts.find(p => p.id === id);
             prof.posts = prof.posts.filter(p => p.id !== id);
-            if (prof.posts.length < pb) changed = true;
+            if (prof.posts.length < pb) {
+              changed = true;
+              // Clean peer post image cache too
+              if (peerPost?.imageId) {
+                this.ft.fileCache.delete(peerPost.imageId);
+                this.ft.outgoing.delete(peerPost.imageId);
+                if (window._fileUrls?.[peerPost.imageId]) {
+                  try { URL.revokeObjectURL(window._fileUrls[peerPost.imageId].url); } catch (_) {}
+                  delete window._fileUrls[peerPost.imageId];
+                }
+              }
+            }
           }
         }
       } else if (info.type === 'story') {
@@ -1986,6 +2041,12 @@ class Node {
     if (changed) {
       DB.setKey('profile', this.profile);
       this._saveStories();
+      // Refresh UI so deleted items disappear
+      if (typeof renderChannel === 'function') scheduleRender();
+      if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+      if (typeof refreshChannelList === 'function') refreshChannelList();
+      ui();
+      console.log(`Tombstones applied: ${this.tombstones.size} items enforced`);
     }
   }
 
