@@ -209,7 +209,7 @@ class Node {
     this._status = s;
     const tag = document.getElementById('statusTag');
     if (!tag) return;
-    tag.textContent = 'v1.1.5';
+    tag.textContent = 'v1.1.6';
     if (s === 'connected') tag.className = 'tag tag-on';
     else if (s === 'reconnecting') tag.className = 'tag tag-warn';
     else tag.className = 'tag tag-off';
@@ -616,8 +616,8 @@ class Node {
         mediaApprovals: [...this.mod.approvedMedia].slice(-200),
         mediaRejections: [...this.mod.rejectedMedia].slice(-200),
         slowMode: this._slowMode || {},
-        // Social data (v21)
-        profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, posts: (this.profile.posts || []).slice(-200) },
+        // Social data — own profile (without posts, posts go in social-sync)
+        profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar },
         pins: this.pins,
         broadcastChannels: [...this.broadcastChannels],
         stories: this._getActiveStories(),
@@ -628,6 +628,9 @@ class Node {
       // Send history for sync
       const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel));
       if (history.length) this.sendTo(pid, { type: 'history-sync', messages: history });
+
+      // Send comprehensive social sync — ALL known posts, reactions, likes from all users
+      this._sendSocialSync(pid);
 
       // If this peer is admin/mod, flush our pending queue to them
       // (small delay so their handshake arrives first and they know they're admin)
@@ -676,8 +679,6 @@ class Node {
       case 'file-chunk': this.onFileChunk(d, from); break;
       case 'file-have': this._onFileHave(d, from); break;
       case 'file-request': this._onFileRequest(d, from); break;
-      case 'file-have': this._onFileHave(d, from); break;
-      case 'file-request': this._onFileRequest(d, from); break;
       case 'mod-roles': this.onModRoles(d); break;
       case 'mod-ads': this.onModAds(d, from); break;
       case 'reaction': this.onReaction(d, from); break;
@@ -693,8 +694,10 @@ class Node {
       case 'profile-update': this.onProfileUpdate(d, from); break;
       case 'pin': this.onPin(d, from); break;
       case 'social-post': this.onSocialPost(d, from); break;
+      case 'social-post-like': this.onSocialPostLike(d, from); break;
       case 'social-post-delete': this._onPostDelete(d, from); break;
       case 'story-delete': this._onStoryDelete(d, from); break;
+      case 'social-sync': this.onSocialSync(d, from); break;
       case 'signal-relay-request': this._onRelayRequest(d, from); break;
       case 'signal-relay': this._onRelaySignal(d, from); break;
     }
@@ -765,14 +768,29 @@ class Node {
       DB.setKey('slowMode', this._slowMode);
     }
 
-    // Merge social data (v21)
+    // Merge social data (v1.1.6 — merge, don't overwrite)
     const senderId = d.nodeId || from;
     if (d.profile) {
-      this.peerProfiles.set(senderId, { ...d.profile, lastSeen: Date.now() });
+      const existing = this.peerProfiles.get(senderId) || {};
+      // Merge profile fields but preserve existing posts
+      this.peerProfiles.set(senderId, {
+        ...existing,
+        bio: d.profile.bio ?? existing.bio ?? '',
+        status: d.profile.status ?? existing.status ?? 'offline',
+        emoji: d.profile.emoji ?? existing.emoji ?? '',
+        avatar: d.profile.avatar ?? existing.avatar ?? '',
+        posts: existing.posts || [],  // Posts come via social-sync now
+        lastSeen: Date.now(),
+      });
     }
     if (d.pins && typeof d.pins === 'object') {
       for (const [ch, pns] of Object.entries(d.pins)) {
-        if (Array.isArray(pns)) this.pins[ch] = pns.slice(0, 3);
+        if (Array.isArray(pns) && pns.length > 0) {
+          // Merge pins — union unique, keep max 3
+          const existing = this.pins[ch] || [];
+          const merged = [...new Set([...existing, ...pns])].slice(-3);
+          this.pins[ch] = merged;
+        }
       }
       DB.setKey('pins', this.pins);
     }
@@ -786,6 +804,7 @@ class Node {
           this.stories.set(s.senderId + '-' + s.ts, s);
         }
       }
+      this._saveStories();
     }
 
     // Register peer's file cache as seeders
@@ -1879,75 +1898,210 @@ class Node {
     return badges;
   }
 
-  // ═══ P2P FILE DISTRIBUTION (torrent-style) ═══
 
-  // A peer announces they have a file
-  _onFileHave(d, from) {
-    if (!d.transferId || !d.seederId) return;
-    this.ft.addSeeder(d.transferId, d.seederId);
-    // Forward announcement (1 hop only)
-    if (!d._forwarded) {
-      for (const [pid] of this.peers) {
-        if (pid !== from) this.sendTo(pid, { ...d, _forwarded: true });
+  // ═══ SOCIAL SYNC (v1.1.6) ═══
+  // Sends ALL known social data (posts, reactions, likes) to a peer
+  // This ensures reconnecting peers get everything they missed
+
+  _sendSocialSync(pid) {
+    // Collect ALL posts from all known users (own + peers)
+    const allPosts = [];
+
+    // Own posts
+    for (const post of (this.profile.posts || [])) {
+      allPosts.push({ ...post, _ownerId: this.id });
+    }
+
+    // Peer posts
+    for (const [peerId, prof] of this.peerProfiles) {
+      for (const post of (prof.posts || [])) {
+        allPosts.push({ ...post, _ownerId: peerId });
       }
     }
+
+    // Deduplicate by post ID (in case of overlap)
+    const uniquePosts = [];
+    const seenIds = new Set();
+    for (const p of allPosts) {
+      if (p.id && !seenIds.has(p.id)) {
+        seenIds.add(p.id);
+        uniquePosts.push(p);
+      }
+    }
+
+    // Collect all reactions
+    const reactions = {};
+    for (const [msgId, emojiMap] of this.reactions) {
+      reactions[msgId] = emojiMap;
+    }
+
+    // Collect peer profiles (without posts — posts are sent separately)
+    const profiles = {};
+    for (const [peerId, prof] of this.peerProfiles) {
+      profiles[peerId] = {
+        bio: prof.bio || '',
+        status: prof.status || 'offline',
+        emoji: prof.emoji || '',
+        avatar: prof.avatar || '',
+        name: prof.name || '',
+        lastSeen: prof.lastSeen || 0,
+      };
+    }
+    // Include own profile
+    profiles[this.id] = {
+      bio: this.profile.bio || '',
+      status: this.profile.status || 'online',
+      emoji: this.profile.emoji || '',
+      avatar: this.profile.avatar || '',
+      name: this.name,
+      lastSeen: Date.now(),
+    };
+
+    this.sendTo(pid, {
+      type: 'social-sync',
+      posts: uniquePosts.slice(-500),
+      reactions,
+      profiles,
+    });
   }
 
-  // A peer requests a file from us
-  _onFileRequest(d, from) {
-    if (!d.transferId) return;
-    const file = this.ft.getChunks(d.transferId);
-    if (file) {
-      // Send meta + all chunks
-      this.sendTo(from, { type: 'file-meta', meta: file.meta, sender: 'cache', senderId: this.id, channel: '', msgId: '', approved: true });
-      for (let i = 0; i < file.chunks.length; i++) {
-        this.sendTo(from, { type: 'file-chunk', transferId: d.transferId, index: i, data: file.chunks[i], meta: file.meta });
-      }
-      console.log(`Seeding ${d.transferId.slice(0, 12)} to ${from.slice(0, 8)}`);
-    }
-  }
+  // Handle incoming social sync — merge everything by ID
+  onSocialSync(d, from) {
+    let changed = false;
 
-  // Request a file — ask seeders or all peers
-  requestFile(transferId) {
-    // Already have it?
-    if (window._fileUrls?.[transferId]) return;
-    if (this.ft.hasFile(transferId)) {
-      const cached = this.ft.fileCache.get(transferId);
-      if (cached) {
-        const url = URL.createObjectURL(cached.blob);
-        window._fileUrls = window._fileUrls || {};
-        window._fileUrls[transferId] = { url, meta: cached.meta };
-        scheduleRender();
-        return;
+    // Merge posts — group by owner, dedup by post ID
+    if (Array.isArray(d.posts)) {
+      for (const post of d.posts) {
+        if (!post.id || !post.senderId) continue;
+        const ownerId = post._ownerId || post.senderId;
+
+        if (ownerId === this.id) {
+          // It's our own post — check if we have it
+          if (!(this.profile.posts || []).some(p => p.id === post.id)) {
+            // We don't have it — might have been deleted locally, skip
+            // (We are authority on our own posts)
+          }
+        } else {
+          // Peer post — merge into their profile
+          const prof = this.peerProfiles.get(ownerId) || { posts: [] };
+          if (!prof.posts) prof.posts = [];
+          if (!prof.posts.some(p => p.id === post.id)) {
+            // Clean the _ownerId field before storing
+            const cleanPost = { ...post };
+            delete cleanPost._ownerId;
+            prof.posts.push(cleanPost);
+            if (prof.posts.length > 200) prof.posts = prof.posts.slice(-200);
+            changed = true;
+          } else {
+            // Post exists — merge likes (union)
+            const existing = prof.posts.find(p => p.id === post.id);
+            if (existing && Array.isArray(post.likes)) {
+              const mergedLikes = [...new Set([...(existing.likes || []), ...post.likes])];
+              if (mergedLikes.length > (existing.likes || []).length) {
+                existing.likes = mergedLikes;
+                changed = true;
+              }
+            }
+          }
+          this.peerProfiles.set(ownerId, prof);
+        }
+
+        // Track seeder for post images
+        if (post.imageId && post.senderId) {
+          this.ft.addSeeder(post.imageId, post.senderId);
+        }
       }
     }
-    // Try loading from IndexedDB cache
-    this.ft.loadFromCache(transferId).then(result => {
-      if (result) {
-        const url = URL.createObjectURL(result.blob);
-        window._fileUrls = window._fileUrls || {};
-        window._fileUrls[transferId] = { url, meta: result.meta };
-        scheduleRender();
-      } else {
-        // Not in cache — request from peers
-        const seeders = this.ft.getSeeders(transferId);
-        if (seeders.size > 0) {
-          // Ask a known seeder
-          for (const sid of seeders) {
-            if (this.peers.has(sid)) {
-              this.sendTo(sid, { type: 'file-request', transferId });
-              console.log(`Requesting ${transferId.slice(0, 12)} from seeder ${sid.slice(0, 8)}`);
-              return;
+
+    // Merge reactions
+    if (d.reactions && typeof d.reactions === 'object') {
+      for (const [msgId, emojiMap] of Object.entries(d.reactions)) {
+        if (!this.reactions.has(msgId)) {
+          this.reactions.set(msgId, emojiMap);
+          changed = true;
+        } else {
+          const existing = this.reactions.get(msgId);
+          for (const [emoji, senders] of Object.entries(emojiMap)) {
+            if (!existing[emoji]) {
+              existing[emoji] = [...senders];
+              changed = true;
+            } else {
+              // Union of senders
+              for (const sid of senders) {
+                if (!existing[emoji].includes(sid)) {
+                  existing[emoji].push(sid);
+                  changed = true;
+                }
+              }
             }
           }
         }
-        // No known seeders — broadcast request to all peers
-        for (const [pid] of this.peers) {
-          this.sendTo(pid, { type: 'file-request', transferId });
-        }
-        console.log(`Broadcasting file request: ${transferId.slice(0, 12)}`);
       }
-    });
+    }
+
+    // Merge peer profiles (metadata only — bio, status, etc.)
+    if (d.profiles && typeof d.profiles === 'object') {
+      for (const [peerId, prof] of Object.entries(d.profiles)) {
+        if (peerId === this.id) continue; // Don't overwrite own profile
+        const existing = this.peerProfiles.get(peerId) || {};
+        // Only update if incoming data is newer or we have no data
+        const existingLastSeen = existing.lastSeen || 0;
+        const incomingLastSeen = prof.lastSeen || 0;
+        if (incomingLastSeen >= existingLastSeen || !existing.bio) {
+          this.peerProfiles.set(peerId, {
+            ...existing,
+            bio: prof.bio || existing.bio || '',
+            status: prof.status || existing.status || 'offline',
+            emoji: prof.emoji || existing.emoji || '',
+            avatar: prof.avatar || existing.avatar || '',
+            name: prof.name || existing.name || '',
+            posts: existing.posts || [],  // Preserve existing posts
+            lastSeen: Math.max(existingLastSeen, incomingLastSeen),
+          });
+        }
+      }
+    }
+
+    if (changed) {
+      if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+      scheduleRender();
+    }
+    console.log(`Social sync from ${from.slice(0, 8)}: ${(d.posts || []).length} posts, ${Object.keys(d.reactions || {}).length} reactions`);
+  }
+
+  // Handle social post likes (was missing in v1.1.5!)
+  onSocialPostLike(d, from) {
+    if (!d.postId || !d.likerId) return;
+    // Find the post in own posts or peer posts
+    let post = null;
+    if (d.postOwnerId === this.id) {
+      post = this.profile.posts.find(p => p.id === d.postId);
+      if (post) {
+        const idx = post.likes.indexOf(d.likerId);
+        if (d.toggle && idx < 0) post.likes.push(d.likerId);
+        else if (!d.toggle && idx >= 0) post.likes.splice(idx, 1);
+        DB.setKey('profile', this.profile);
+      }
+    } else {
+      const prof = this.peerProfiles.get(d.postOwnerId);
+      if (prof?.posts) {
+        post = prof.posts.find(p => p.id === d.postId);
+        if (post) {
+          if (!post.likes) post.likes = [];
+          const idx = post.likes.indexOf(d.likerId);
+          if (d.toggle && idx < 0) post.likes.push(d.likerId);
+          else if (!d.toggle && idx >= 0) post.likes.splice(idx, 1);
+        }
+      }
+    }
+    // Forward to other peers
+    const fwd = { ...d, hops: (d.hops || 0) + 1 };
+    if ((fwd.hops || 0) < 3) {
+      for (const [pid] of this.peers) {
+        if (pid !== from) this.sendTo(pid, fwd);
+      }
+    }
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
   }
 
   // ═══ DELETE HANDLERS ═══
