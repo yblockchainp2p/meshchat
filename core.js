@@ -820,7 +820,11 @@ class ModerationEngine {
       if (target === 'pending_image') return '⏳ Media is being reviewed by admin...';
       return null; // No ad to show for plaza/sidebar
     }
-    if (ad.adType === 'script') return `<div class="ad-script-slot" data-adscript="${btoa(ad.scriptCode || ad.text)}"></div>`;
+    if (ad.adType === 'script') {
+      // Use iframe for 3rd party ad scripts (Adsterra etc) — they need their own document context
+      const escaped = (ad.scriptCode || ad.text).replace(/"/g, '&quot;');
+      return `<div class="ad-script-slot"><iframe class="ad-iframe" srcdoc="<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width'><style>body{margin:0;overflow:hidden;background:transparent;}</style></head><body>${escaped}</body></html>" scrolling="no" frameborder="0" style="width:100%;min-height:60px;border:none;overflow:hidden;"></iframe></div>`;
+    }
     if (ad.adType === 'banner') return `<a href="${ad.link || '#'}" target="_blank" rel="noopener sponsored" style="display:block;"><img src="${ad.text}" style="max-width:100%;border-radius:6px;" alt="Ad"></a>`;
     if (ad.adType === 'html') return `<div class="ad-html-slot">${ad.scriptCode || ad.text}</div>`;
     return ad.link ? `<a href="${ad.link}" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none;">${ad.text}</a>` : ad.text;
@@ -1008,7 +1012,10 @@ class FileTransfer {
       const start = i * FILE_CFG.CHUNK_SIZE;
       const end = Math.min(start + FILE_CFG.CHUNK_SIZE, data.length);
       const chunk = data.slice(start, end);
-      chunks.push(btoa(String.fromCharCode(...chunk)));
+      // Safe base64 encoding (no spread operator — avoids stack overflow on large chunks)
+      let binary = '';
+      for (let j = 0; j < chunk.length; j++) binary += String.fromCharCode(chunk[j]);
+      chunks.push(btoa(binary));
     }
     this.outgoing.set(transferId, { meta, chunks });
 
@@ -1111,7 +1118,10 @@ class FileTransfer {
             for (let i = 0; i < totalChunks; i++) {
               const start = i * FILE_CFG.CHUNK_SIZE;
               const end = Math.min(start + FILE_CFG.CHUNK_SIZE, bytes.length);
-              chunks.push(btoa(String.fromCharCode(...bytes.slice(start, end))));
+              const slice = bytes.slice(start, end);
+              let binary = '';
+              for (let j = 0; j < slice.length; j++) binary += String.fromCharCode(slice[j]);
+              chunks.push(btoa(binary));
             }
             this.outgoing.set(transferId, { meta: req.result.meta, chunks });
             r({ blob, meta: req.result.meta });

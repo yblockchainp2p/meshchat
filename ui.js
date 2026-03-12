@@ -548,25 +548,6 @@ function renderChannel() {
   el.appendChild(frag);
   el.scrollTop = el.scrollHeight;
 
-  // Inject script ads into pending image placeholders
-  el.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
-    try {
-      const code = atob(slot.dataset.adscript);
-      const container = document.createElement('div');
-      container.innerHTML = code;
-      container.querySelectorAll('script').forEach(oldScript => {
-        const newScript = document.createElement('script');
-        if (oldScript.src) newScript.src = oldScript.src;
-        else newScript.textContent = oldScript.textContent;
-        slot.appendChild(newScript);
-      });
-      while (container.firstChild) {
-        if (container.firstChild.nodeName !== 'SCRIPT') slot.appendChild(container.firstChild);
-        else container.removeChild(container.firstChild);
-      }
-    } catch (e) { console.error('Ad inject:', e); }
-  });
-
   // Start channel ad timer (5 min interval, per user session)
   _startChannelAdTimer();
 }
@@ -593,7 +574,7 @@ function _showChannelAd() {
   const adContent = N.mod.getAdPlaceholder('sidebar');
   if (!adContent) return;
   
-  const isScript = adContent.includes('ad-script-slot');
+  const isScript = adContent.includes('ad-iframe');
   const adMsg = document.createElement('div');
   adMsg.className = 'm m-sys channel-ad-msg';
   if (isScript) adMsg.style.display = 'none';
@@ -604,26 +585,11 @@ function _showChannelAd() {
   el.appendChild(adMsg);
   if (!isScript) el.scrollTop = el.scrollHeight;
 
-  // Inject scripts
-  adMsg.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
-    try {
-      const code = atob(slot.dataset.adscript);
-      const div = document.createElement('div');
-      div.innerHTML = code;
-      div.querySelectorAll('script').forEach(old => {
-        const s = document.createElement('script');
-        if (old.src) s.src = old.src; else s.textContent = old.textContent;
-        slot.appendChild(s);
-      });
-    } catch (_) {}
-  });
-
-  // Only script ads need delayed check
+  // Script iframe ads: show after iframe loads
   if (isScript) {
     setTimeout(() => {
-      const zone = adMsg.querySelector('.ad-inject-zone');
-      const hasContent = zone && (zone.querySelector('iframe, img, ins, [id]') || zone.children.length > 1);
-      if (hasContent) { adMsg.style.display = ''; el.scrollTop = el.scrollHeight; }
+      const iframe = adMsg.querySelector('.ad-iframe');
+      if (iframe) { adMsg.style.display = ''; el.scrollTop = el.scrollHeight; }
       else adMsg.remove();
     }, 3000);
   }
@@ -1891,7 +1857,7 @@ function refreshPlazaFeed() {
     const adContent = N.mod.getAdPlaceholder('plaza_feed');
     if (!adContent) return '';
     // Text/banner/html ads show immediately, script ads start hidden
-    const isScript = adContent.includes('ad-script-slot');
+    const isScript = adContent.includes('ad-iframe');
     return `<div class="plaza-ad-slot" style="padding:12px;border-bottom:1px solid var(--brd);text-align:center;${isScript ? 'display:none;' : ''}" data-adslot="${isScript ? 'script' : 'static'}">
       <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
       <div class="ad-inject-zone">${adContent}</div>
@@ -2005,29 +1971,19 @@ function refreshPlazaFeed() {
 
 // Inject script-type ads into ad slots, show on load, remove if empty after 3s
 function _injectPlazaAds(container) {
-  // Inject script tags
-  container.querySelectorAll('.ad-script-slot[data-adscript]').forEach(slot => {
-    try {
-      const code = atob(slot.dataset.adscript);
-      const div = document.createElement('div');
-      div.innerHTML = code;
-      div.querySelectorAll('script').forEach(old => {
-        const s = document.createElement('script');
-        if (old.src) s.src = old.src; else s.textContent = old.textContent;
-        slot.appendChild(s);
-      });
-    } catch (_) {}
-  });
-  // Only script ad slots need delayed visibility check
+  // Script ads now use iframes — only need visibility check for script type
   container.querySelectorAll('[data-adslot="script"]').forEach(slot => {
     setTimeout(() => {
-      const zone = slot.querySelector('.ad-inject-zone');
-      const hasContent = zone && (zone.querySelector('iframe, img, ins, [id]') || zone.children.length > 1);
-      if (hasContent) slot.style.display = '';
-      else slot.remove();
+      const iframe = slot.querySelector('.ad-iframe');
+      if (iframe) {
+        slot.style.display = '';
+        // Auto-resize iframe to content
+        try { iframe.style.height = (iframe.contentWindow.document.body.scrollHeight || 100) + 'px'; } catch(_) {}
+      } else {
+        slot.remove();
+      }
     }, 3000);
   });
-  // Static ad slots are already visible — no action needed
 }
 
 function timeAgo(ts) {

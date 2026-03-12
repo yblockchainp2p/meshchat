@@ -1690,7 +1690,10 @@ class Node {
         for (let i = 0; i < meta.totalChunks; i++) {
           const start = i * 16384;
           const end = Math.min(start + 16384, bytes.length);
-          chunks.push(btoa(String.fromCharCode(...bytes.slice(start, end))));
+          const slice = bytes.slice(start, end);
+          let bin = '';
+          for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
+          chunks.push(btoa(bin));
         }
         this.ft.outgoing.set(fileId, { meta, chunks });
       } catch (_) {
