@@ -821,9 +821,11 @@ class ModerationEngine {
       return null; // No ad to show for plaza/sidebar
     }
     if (ad.adType === 'script') {
-      // Use iframe for 3rd party ad scripts (Adsterra etc) — they need their own document context
-      const escaped = (ad.scriptCode || ad.text).replace(/"/g, '&quot;');
-      return `<div class="ad-script-slot"><iframe class="ad-iframe" srcdoc="<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width'><style>body{margin:0;overflow:hidden;background:transparent;}</style></head><body>${escaped}</body></html>" scrolling="no" frameborder="0" style="width:100%;min-height:60px;border:none;overflow:hidden;"></iframe></div>`;
+      // Use blob URL iframe — most reliable for 3rd party ad scripts
+      const code = ad.scriptCode || ad.text;
+      const html = `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><style>body{margin:0;overflow:hidden;background:transparent;display:flex;align-items:center;justify-content:center;min-height:50px;}</style></head><body>${code}</body></html>`;
+      const id = 'adiframe-' + Math.random().toString(36).slice(2, 8);
+      return `<div class="ad-script-slot" data-adhtml="${btoa(unescape(encodeURIComponent(html)))}" data-adiframe="${id}"><iframe id="${id}" class="ad-iframe" style="width:100%;min-height:250px;border:none;overflow:hidden;" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin" scrolling="no" frameborder="0"></iframe></div>`;
     }
     if (ad.adType === 'banner') return `<a href="${ad.link || '#'}" target="_blank" rel="noopener sponsored" style="display:block;"><img src="${ad.text}" style="max-width:100%;border-radius:6px;" alt="Ad"></a>`;
     if (ad.adType === 'html') return `<div class="ad-html-slot">${ad.scriptCode || ad.text}</div>`;
@@ -1001,12 +1003,20 @@ class FileTransfer {
     const data = new Uint8Array(buffer);
     const totalChunks = Math.ceil(data.length / FILE_CFG.CHUNK_SIZE);
 
-    let thumb = '';
-    if (file.type.startsWith('image/')) {
-      thumb = await this.makeThumbnail(file);
+    // Detect file type — mobile browsers may leave type empty
+    let fileType = file.type || '';
+    if (!fileType) {
+      const ext = (file.name || '').split('.').pop()?.toLowerCase();
+      const typeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml' };
+      fileType = typeMap[ext] || 'image/jpeg'; // default to jpeg since we only accept images
     }
 
-    const meta = { transferId, fileName: file.name, fileSize: file.size, fileType: file.type, totalChunks, thumb };
+    let thumb = '';
+    if (fileType.startsWith('image/')) {
+      try { thumb = await this.makeThumbnail(file); } catch(e) { console.error('Thumb error:', e); }
+    }
+
+    const meta = { transferId, fileName: file.name || 'image.jpg', fileSize: file.size, fileType, totalChunks, thumb };
     const chunks = [];
     for (let i = 0; i < totalChunks; i++) {
       const start = i * FILE_CFG.CHUNK_SIZE;

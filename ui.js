@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1.3
+// 8. UI RENDERING — MeshChat v1.1.5
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -217,19 +217,25 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   // File/media content
   let fileContent = '';
   if (fileMeta) {
-    const isMedia = fileMeta.fileType?.startsWith('image/') || fileMeta.fileType?.startsWith('video/');
-    const status = isMedia ? N.mod.getMediaStatus(fileMeta.transferId) : 'approved';
+    const status = N.mod.getMediaStatus(fileMeta.transferId);
     const fileUrl = window._fileUrls?.[fileMeta.transferId];
-    if (isMedia && status === 'pending') {
-      fileContent = `<div class="file-pending"><div class="file-ad">${N.mod.getAdPlaceholder('pending_image')}</div></div>`;
-    } else if (isMedia && status === 'rejected') {
+    const isMine = senderId === N.id;
+    if (status === 'rejected' && !isMine) {
       fileContent = `<div class="file-rejected">Media removed</div>`;
-    } else if (fileUrl && fileMeta.fileType?.startsWith('image/')) {
-      fileContent = `<div class="file-img"><img src="${fileUrl.url}"></div>`;
     } else if (fileUrl) {
-      fileContent = `<div class="file-dl"><a href="${fileUrl.url}" download="${esc(fileMeta.fileName)}" style="color:var(--cyan);">📥 ${esc(fileMeta.fileName)}</a></div>`;
-    } else if (fileMeta.thumb && status === 'approved') {
+      // Have full image — show it (own images always, approved images for others)
+      fileContent = `<div class="file-img"><img src="${fileUrl.url}"></div>`;
+    } else if (isMine && fileMeta.thumb) {
+      // Own image but no blob URL yet — show thumb
+      fileContent = `<div class="file-img"><img src="${fileMeta.thumb}"></div>`;
+    } else if (status === 'pending' && !isMine) {
+      // Other's image pending approval — show ad
+      fileContent = `<div class="file-pending"><div class="file-ad">${N.mod.getAdPlaceholder('pending_image')}</div></div>`;
+    } else if (fileMeta.thumb) {
+      // Approved but no blob — show thumb with tap to load
       fileContent = `<div class="file-img file-thumb-click" data-tid="${esc(fileMeta.transferId)}"><img src="${fileMeta.thumb}" style="opacity:0.7;cursor:pointer;" title="Tap to load full image"><div style="font-size:9px;color:var(--t3);text-align:center;">Tap to load</div></div>`;
+    } else {
+      fileContent = `<div class="file-pending" style="padding:10px;text-align:center;font-size:11px;color:var(--t3);">📷 Image</div>`;
     }
   }
 
@@ -548,8 +554,24 @@ function renderChannel() {
   el.appendChild(frag);
   el.scrollTop = el.scrollHeight;
 
+  // Initialize ad iframes (blob URL approach)
+  _initAdIframes(el);
+
   // Start channel ad timer (5 min interval, per user session)
   _startChannelAdTimer();
+}
+
+// Initialize script ad iframes with blob URLs
+function _initAdIframes(container) {
+  container.querySelectorAll('.ad-script-slot[data-adhtml]').forEach(slot => {
+    const iframe = slot.querySelector('.ad-iframe');
+    if (!iframe || iframe.src) return; // already initialized
+    try {
+      const html = decodeURIComponent(escape(atob(slot.dataset.adhtml)));
+      const blob = new Blob([html], { type: 'text/html' });
+      iframe.src = URL.createObjectURL(blob);
+    } catch (e) { console.error('Ad iframe:', e); }
+  });
 }
 
 // ═══ CHANNEL AD TIMER ═══
@@ -585,11 +607,12 @@ function _showChannelAd() {
   el.appendChild(adMsg);
   if (!isScript) el.scrollTop = el.scrollHeight;
 
-  // Script iframe ads: show after iframe loads
+  // Script iframe ads: init + show after load
+  _initAdIframes(adMsg);
   if (isScript) {
     setTimeout(() => {
       const iframe = adMsg.querySelector('.ad-iframe');
-      if (iframe) { adMsg.style.display = ''; el.scrollTop = el.scrollHeight; }
+      if (iframe && iframe.src) { adMsg.style.display = ''; el.scrollTop = el.scrollHeight; }
       else adMsg.remove();
     }, 3000);
   }
@@ -1971,17 +1994,14 @@ function refreshPlazaFeed() {
 
 // Inject script-type ads into ad slots, show on load, remove if empty after 3s
 function _injectPlazaAds(container) {
-  // Script ads now use iframes — only need visibility check for script type
+  // Init blob URL iframes for script ads
+  _initAdIframes(container);
+  // Script ads: show after iframe loads (3s check)
   container.querySelectorAll('[data-adslot="script"]').forEach(slot => {
     setTimeout(() => {
       const iframe = slot.querySelector('.ad-iframe');
-      if (iframe) {
-        slot.style.display = '';
-        // Auto-resize iframe to content
-        try { iframe.style.height = (iframe.contentWindow.document.body.scrollHeight || 100) + 'px'; } catch(_) {}
-      } else {
-        slot.remove();
-      }
+      if (iframe && iframe.src) slot.style.display = '';
+      else slot.remove();
     }, 3000);
   });
 }

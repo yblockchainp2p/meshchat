@@ -209,7 +209,7 @@ class Node {
     this._status = s;
     const tag = document.getElementById('statusTag');
     if (!tag) return;
-    tag.textContent = 'v1.1.3';
+    tag.textContent = 'v1.1.5';
     if (s === 'connected') tag.className = 'tag tag-on';
     else if (s === 'reconnecting') tag.className = 'tag tag-warn';
     else tag.className = 'tag tag-off';
@@ -1369,15 +1369,12 @@ class Node {
     const lamport = this.clock.tick();
     const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Immediately make file available for own rendering
-    const cached = this.ft.fileCache.get(meta.transferId);
-    if (cached) {
-      window._fileUrls = window._fileUrls || {};
-      window._fileUrls[meta.transferId] = { url: URL.createObjectURL(cached.blob), meta };
-    }
+    // Immediately make file available for own rendering — use original file directly
+    window._fileUrls = window._fileUrls || {};
+    window._fileUrls[meta.transferId] = { url: URL.createObjectURL(file), meta };
 
-    // Register media for approval (images need admin approval)
-    const needsApproval = meta.fileType.startsWith('image/') || meta.fileType.startsWith('video/');
+    // All files are images now (accept=image/*) — always need approval
+    const needsApproval = true;
     if (needsApproval) {
       this.mod.registerMedia(meta.transferId, this.name, this.id, ch, meta.thumb);
       if (this.mod.isAdmin || this.mod.isMod) {
@@ -1413,17 +1410,14 @@ class Node {
   }
 
   onFileMeta(d, from) {
-    const needsApproval = d.meta?.fileType?.startsWith('image/') || d.meta?.fileType?.startsWith('video/');
-    if (needsApproval && d.meta) {
-      // If sender already approved (admin/mod), auto-approve on our side too
-      if (d.approved) {
-        this.mod.approveMedia(d.meta.transferId);
-      } else {
-        this.mod.registerMedia(d.meta.transferId, d.sender || 'unknown', d.senderId || from, d.channel || 'general', d.meta.thumb || '');
-        if (this.mod.isAdmin || this.mod.isMod) {
-          setAdminAlert(true);
-          showToast('📸 Media', `${d.sender || 'Someone'} sent media for review`, 'mention', null);
-        }
+    if (!d.meta) return;
+    if (d.approved) {
+      this.mod.approveMedia(d.meta.transferId);
+    } else {
+      this.mod.registerMedia(d.meta.transferId, d.sender || 'unknown', d.senderId || from, d.channel || 'general', d.meta.thumb || '');
+      if (this.mod.isAdmin || this.mod.isMod) {
+        setAdminAlert(true);
+        showToast('📸 Media', `${d.sender || 'Someone'} sent media for review`, 'mention', null);
       }
     }
   }
