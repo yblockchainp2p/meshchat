@@ -33,6 +33,8 @@ class Node {
     this.relayPeers = new Map(); // targetId -> relayPeerId
     this._relayCount = 0; // rate limit counter
     this._relayResetTimer = null;
+    // ── Tombstones (v1.1.6) — deleted item IDs survive reconnect ──
+    this.tombstones = new Map(); // id -> { ts, type } — deleted msgIds, postIds, storyKeys
   }
 
   async init(name) {
@@ -88,6 +90,17 @@ class Node {
 
     // Don't auto-assign admin here — wait for bootstrap peer list
     this.mod.checkAdmin(this.id);
+
+    // Load tombstones (v1.1.6)
+    const ts_data = await DB.getKey('tombstones');
+    if (Array.isArray(ts_data)) {
+      const cutoff = Date.now() - 48 * 3600 * 1000; // 48h TTL
+      for (const t of ts_data) {
+        if (t.ts > cutoff) this.tombstones.set(t.id, { ts: t.ts, type: t.type });
+      }
+    }
+    // Apply tombstones to loaded data — remove anything that was deleted while we were offline
+    this._applyTombstones();
 
     // Restore Lamport clock from stored messages
     for (const m of this.store.getAll()) {
@@ -389,6 +402,7 @@ class Node {
     }
     this.store.deleteMsg(msgId);
     this.reactions.delete(msgId);
+    this._addTombstone(msgId, 'msg');
     const d = { type: 'delete-msg', msgId, senderId: this.id, deletedBy: this.id, ts: Date.now() };
     d.sig = await this.crypto.sign(d);
     for (const [pid] of this.peers) this.sendTo(pid, d);
@@ -414,6 +428,7 @@ class Node {
     }
     this.store.deleteMsg(d.msgId);
     this.reactions.delete(d.msgId);
+    this._addTombstone(d.msgId, 'msg');
     const fwd = { ...d, hops: (d.hops || 0) + 1 };
     if ((fwd.hops || 0) < CFG.TTL) {
       for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
@@ -623,10 +638,12 @@ class Node {
         stories: this._getActiveStories(),
         // File seeder info — which files we have cached
         fileHaves: [...this.ft.fileCache.keys()].slice(-100),
+        // Tombstones — deleted items that must not resurrect (v1.1.6)
+        tombstones: this._getTombstonePacket(),
       });
 
-      // Send history for sync
-      const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel));
+      // Send history for sync — filter out tombstoned messages
+      const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel) && !this._isTombstoned(m.msgId));
       if (history.length) this.sendTo(pid, { type: 'history-sync', messages: history });
 
       // Send comprehensive social sync — ALL known posts, reactions, likes from all users
@@ -814,6 +831,11 @@ class Node {
       }
     }
 
+    // Merge tombstones (v1.1.6) — learn about deletions we missed while offline
+    if (Array.isArray(d.tombstones)) {
+      this._mergeTombstones(d.tombstones);
+    }
+
     // If this peer is admin/mod, flush our pending admin queue to them
     if (this.mod.admins.has(senderId) || this.mod.mods.has(senderId)) {
       this._flushToAdmin(from);
@@ -846,6 +868,8 @@ class Node {
     if (this.gossip.has(d.msgId)) return;
     this.gossip.mark(d.msgId);
     if (d.hops >= CFG.TTL) return;
+    // Tombstone check — reject messages that were already deleted (v1.1.6)
+    if (this._isTombstoned(d.msgId)) return;
 
     // Block check — silently drop messages from blocked users
     if (this.blocked.has(d.senderId)) return;
@@ -1535,8 +1559,8 @@ class Node {
   // ── History sync ──
   onHistSync(d) {
     if (!d.messages?.length) return;
-    // Filter out DMs (don't sync private messages)
-    const pub = d.messages.filter(m => m.type !== 'dm');
+    // Filter out DMs and tombstoned messages
+    const pub = d.messages.filter(m => m.type !== 'dm' && !this._isTombstoned(m.msgId));
     const added = this.store.merge(pub);
     if (added > 0) {
       for (const m of pub) { this.gossip.mark(m.msgId); this.clock.update(m.lamport || 0); this.chMgr.joined.add(m.channel || 'general'); }
@@ -1730,6 +1754,8 @@ class Node {
 
   onSocialPost(d, from) {
     if (!d.post?.id || !d.post.senderId) return;
+    // Tombstone check — reject posts that were deleted (v1.1.6)
+    if (this._isTombstoned(d.post.id)) return;
     const p = this.peerProfiles.get(d.post.senderId) || { posts: [] };
     if (!p.posts) p.posts = [];
     if (p.posts.some(x => x.id === d.post.id)) return;
@@ -1762,6 +1788,7 @@ class Node {
 
   // Delete a social post (own or admin)
   deleteSocialPost(postId, postOwnerId) {
+    this._addTombstone(postId, 'post');
     if (postOwnerId === this.id) {
       this.profile.posts = this.profile.posts.filter(p => p.id !== postId);
       DB.setKey('profile', this.profile);
@@ -1777,6 +1804,7 @@ class Node {
 
   // Delete a story (own or admin)
   deleteStory(storyKey) {
+    this._addTombstone(storyKey, 'story');
     this.stories.delete(storyKey);
     this._saveStories();
     // Broadcast
@@ -1800,6 +1828,8 @@ class Node {
     const key = d.story.senderId + '-' + d.story.ts;
     if (this.stories.has(key)) return;
     if (d.story.expiresAt <= Date.now()) return;
+    // Tombstone check (v1.1.6)
+    if (this._isTombstoned(key)) return;
     this.stories.set(key, d.story);
     this._saveStories();
     if ((d.hops || 0) < 3) {
@@ -1813,7 +1843,7 @@ class Node {
     const active = [];
     let changed = false;
     for (const [key, s] of this.stories) {
-      if (s.expiresAt > now) active.push(s);
+      if (s.expiresAt > now && !this._isTombstoned(key)) active.push(s);
       else { this.stories.delete(key); changed = true; }
     }
     if (changed) this._saveStories();
@@ -1898,6 +1928,93 @@ class Node {
     return badges;
   }
 
+  // ═══ TOMBSTONE SYSTEM (v1.1.6) ═══
+  // Tracks deleted items so they don't resurrect when offline peers reconnect
+
+  // Add a tombstone (call on every delete)
+  _addTombstone(id, type) {
+    this.tombstones.set(id, { ts: Date.now(), type });
+    this._saveTombstones();
+  }
+
+  // Merge incoming tombstones from a peer
+  _mergeTombstones(incoming) {
+    if (!Array.isArray(incoming)) return;
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    let changed = false;
+    for (const t of incoming) {
+      if (!t.id || !t.ts) continue;
+      if (t.ts < cutoff) continue; // expired
+      if (!this.tombstones.has(t.id)) {
+        this.tombstones.set(t.id, { ts: t.ts, type: t.type });
+        changed = true;
+      }
+    }
+    if (changed) {
+      this._saveTombstones();
+      this._applyTombstones();
+    }
+  }
+
+  // Apply all tombstones — remove deleted items from local data
+  _applyTombstones() {
+    let changed = false;
+    for (const [id, info] of this.tombstones) {
+      if (info.type === 'msg') {
+        if (this.store.deleteMsg(id)) changed = true;
+        this.reactions.delete(id);
+      } else if (info.type === 'post') {
+        // Delete from own posts
+        const before = this.profile.posts.length;
+        this.profile.posts = this.profile.posts.filter(p => p.id !== id);
+        if (this.profile.posts.length < before) changed = true;
+        // Delete from all peer profiles
+        for (const [, prof] of this.peerProfiles) {
+          if (prof.posts) {
+            const pb = prof.posts.length;
+            prof.posts = prof.posts.filter(p => p.id !== id);
+            if (prof.posts.length < pb) changed = true;
+          }
+        }
+      } else if (info.type === 'story') {
+        if (this.stories.has(id)) {
+          this.stories.delete(id);
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      DB.setKey('profile', this.profile);
+      this._saveStories();
+    }
+  }
+
+  // Prune expired tombstones (>48h) and save
+  _saveTombstones() {
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    const arr = [];
+    for (const [id, info] of this.tombstones) {
+      if (info.ts > cutoff) arr.push({ id, ts: info.ts, type: info.type });
+      else this.tombstones.delete(id);
+    }
+    DB.setKey('tombstones', arr);
+  }
+
+  // Get tombstones for sending to peers
+  _getTombstonePacket() {
+    const arr = [];
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    for (const [id, info] of this.tombstones) {
+      if (info.ts > cutoff) arr.push({ id, ts: info.ts, type: info.type });
+    }
+    return arr;
+  }
+
+  // Check if an item is tombstoned
+  _isTombstoned(id) {
+    return this.tombstones.has(id);
+  }
+
 
   // ═══ SOCIAL SYNC (v1.1.6) ═══
   // Sends ALL known social data (posts, reactions, likes) to a peer
@@ -1919,20 +2036,20 @@ class Node {
       }
     }
 
-    // Deduplicate by post ID (in case of overlap)
+    // Deduplicate by post ID and filter out tombstoned posts
     const uniquePosts = [];
     const seenIds = new Set();
     for (const p of allPosts) {
-      if (p.id && !seenIds.has(p.id)) {
+      if (p.id && !seenIds.has(p.id) && !this._isTombstoned(p.id)) {
         seenIds.add(p.id);
         uniquePosts.push(p);
       }
     }
 
-    // Collect all reactions
+    // Collect all reactions (skip tombstoned message reactions)
     const reactions = {};
     for (const [msgId, emojiMap] of this.reactions) {
-      reactions[msgId] = emojiMap;
+      if (!this._isTombstoned(msgId)) reactions[msgId] = emojiMap;
     }
 
     // Collect peer profiles (without posts — posts are sent separately)
@@ -1969,10 +2086,12 @@ class Node {
   onSocialSync(d, from) {
     let changed = false;
 
-    // Merge posts — group by owner, dedup by post ID
+    // Merge posts — group by owner, dedup by post ID, skip tombstoned
     if (Array.isArray(d.posts)) {
       for (const post of d.posts) {
         if (!post.id || !post.senderId) continue;
+        // Skip tombstoned posts — they were deleted
+        if (this._isTombstoned(post.id)) continue;
         const ownerId = post._ownerId || post.senderId;
 
         if (ownerId === this.id) {
@@ -2013,9 +2132,10 @@ class Node {
       }
     }
 
-    // Merge reactions
+    // Merge reactions (skip tombstoned messages)
     if (d.reactions && typeof d.reactions === 'object') {
       for (const [msgId, emojiMap] of Object.entries(d.reactions)) {
+        if (this._isTombstoned(msgId)) continue;
         if (!this.reactions.has(msgId)) {
           this.reactions.set(msgId, emojiMap);
           changed = true;
@@ -2107,6 +2227,7 @@ class Node {
   // ═══ DELETE HANDLERS ═══
   _onPostDelete(d, from) {
     if (!d.postId) return;
+    this._addTombstone(d.postId, 'post');
     let found = false;
     // Delete from own posts
     const ownBefore = this.profile.posts.length;
@@ -2129,6 +2250,7 @@ class Node {
 
   _onStoryDelete(d, from) {
     if (!d.storyKey) return;
+    this._addTombstone(d.storyKey, 'story');
     this.stories.delete(d.storyKey);
     this._saveStories();
     // Gossip forward
