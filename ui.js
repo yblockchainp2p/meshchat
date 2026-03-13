@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1.6
+// 8. UI RENDERING — MeshChat v1.1.7
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -230,7 +230,7 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
       fileContent = `<div class="file-img"><img src="${fileMeta.thumb}"></div>`;
     } else if (status === 'pending' && !isMine) {
       // Other's image pending approval — show ad
-      fileContent = `<div class="file-pending"><div class="file-ad">${N.mod.getAdPlaceholder('pending_image')}</div></div>`;
+      fileContent = `<div class="file-pending" style="padding:8px;border-radius:6px;overflow:hidden;"><div class="file-ad">${N.mod.getAdPlaceholder('pending_image')}</div></div>`;
     } else if (fileMeta.thumb) {
       // Approved but no blob — show thumb with tap to load
       fileContent = `<div class="file-img file-thumb-click" data-tid="${esc(fileMeta.transferId)}"><img src="${fileMeta.thumb}" style="opacity:0.7;cursor:pointer;" title="Tap to load full image"><div style="font-size:9px;color:var(--t3);text-align:center;">Tap to load</div></div>`;
@@ -598,16 +598,14 @@ function _showChannelAd() {
   
   const isScript = adContent.includes('ad-iframe');
   const adMsg = document.createElement('div');
-  adMsg.className = 'm m-sys channel-ad-msg';
+  adMsg.className = 'm';
   if (isScript) adMsg.style.display = 'none';
-  adMsg.innerHTML = `<div class="mb" style="text-align:center;">
-    <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
-    <div class="ad-inject-zone">${adContent}</div>
-  </div>`;
+  // Native message look — appears like a regular user message
+  const adColor = 'hsl(180,65%,65%)';
+  adMsg.innerHTML = `<div class="mh"><span class="mn" style="color:${adColor};">📢 MeshChat</span> <span class="mt" style="color:var(--t3);font-size:9px;">Ad</span></div><div class="mb"><div class="ad-inject-zone" style="overflow:hidden;border-radius:6px;">${adContent}</div></div>`;
   el.appendChild(adMsg);
   if (!isScript) el.scrollTop = el.scrollHeight;
 
-  // Script iframe ads: init + show after load
   _initAdIframes(adMsg);
   if (isScript) {
     setTimeout(() => {
@@ -1874,16 +1872,21 @@ function refreshPlazaFeed() {
   }
   allPosts.sort((a, b) => b.ts - a.ts);
 
-  // Ad HTML generator — returns '' if no ads configured
-  // Ad slot starts hidden, becomes visible when script loads content
+  // Ad HTML generator — looks like a native post, blends into feed
   const makeAdHtml = () => {
     const adContent = N.mod.getAdPlaceholder('plaza_feed');
     if (!adContent) return '';
-    // Text/banner/html ads show immediately, script ads start hidden
     const isScript = adContent.includes('ad-iframe');
-    return `<div class="plaza-ad-slot" style="padding:12px;border-bottom:1px solid var(--brd);text-align:center;${isScript ? 'display:none;' : ''}" data-adslot="${isScript ? 'script' : 'static'}">
-      <div style="font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Sponsored</div>
-      <div class="ad-inject-zone">${adContent}</div>
+    const adColor = 'hsl(180,65%,65%)';
+    return `<div class="live-post" style="${isScript ? 'display:none;' : ''}" data-adslot="${isScript ? 'script' : 'static'}">
+      <div class="live-post-header">
+        <div class="live-post-avatar" style="background:${adColor}18;color:${adColor};font-size:14px;">📢</div>
+        <div>
+          <span class="live-post-name" style="color:${adColor};">MeshChat</span>
+          <div class="live-post-time">ad</div>
+        </div>
+      </div>
+      <div class="live-post-text"><div class="ad-inject-zone" style="overflow:hidden;border-radius:6px;">${adContent}</div></div>
     </div>`;
   };
 

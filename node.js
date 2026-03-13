@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.1.6 — ActionLog Node
+// MeshChat v1.1.7 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -83,6 +83,7 @@ class Node {
     this.reactions = this.state.reactions;
     this.pins = this.state.pins;
     this.stories = this.state.stories;
+    // Sync profiles
     for (const [pid, p] of this.state.profiles) {
       if (pid !== this.id) {
         const ex = this.peerProfiles.get(pid) || {};
@@ -92,6 +93,20 @@ class Node {
         this.profile.status = p.status || this.profile.status;
         this.profile.emoji = p.emoji || this.profile.emoji;
         this.profile.avatar = p.avatar || this.profile.avatar;
+      }
+    }
+    // Sync ALL post owners into peerProfiles (even those without 'profile' actions)
+    const postOwners = new Set();
+    for (const post of this.state.posts) { if (post.senderId) postOwners.add(post.senderId); }
+    for (const pid of postOwners) {
+      if (pid === this.id) continue;
+      if (!this.peerProfiles.has(pid)) {
+        // Find name from posts
+        const firstPost = this.state.posts.find(p => p.senderId === pid);
+        this.peerProfiles.set(pid, { bio: '', status: 'offline', emoji: '', avatar: '', name: firstPost?.senderName || pid.slice(0,8), posts: this.state.getUserPosts(pid) });
+      } else {
+        const ex = this.peerProfiles.get(pid);
+        ex.posts = this.state.getUserPosts(pid);
       }
     }
     this.profile.posts = this.state.getUserPosts(this.id);
@@ -164,24 +179,24 @@ class Node {
     await this.sendChat('↗ ' + msg.sender + ': ' + msg.text);
   }
 
-  sendReaction(msgId, emoji) {
+  async sendReaction(msgId, emoji) {
     if (!msgId || !emoji) return;
     const rm = this.state.reactions.get(msgId) || {};
     const has = (rm[emoji] || []).includes(this.id);
-    this._emit('reaction', { emoji, toggle: !has }, { targetId: msgId });
+    await this._emit('reaction', { emoji, toggle: !has }, { targetId: msgId });
     renderChannel();
   }
 
-  sendPoll(question, options) {
+  async sendPoll(question, options) {
     const ch = this.chMgr.current;
     const poll = { question, options: options.map(o => ({ text: o, votes: [] })) };
-    this._emit('msg', { text: '📊 ' + question, poll, hops: 0 }, { channel: ch });
+    await this._emit('msg', { text: '📊 ' + question, poll, hops: 0 }, { channel: ch });
     refreshChannelList();
   }
 
-  votePoll(msgId, optIdx) { this._emit('poll-vote', { optIdx }, { targetId: msgId }); renderChannel(); }
+  async votePoll(msgId, optIdx) { await this._emit('poll-vote', { optIdx }, { targetId: msgId }); renderChannel(); }
 
-  sendSocialPost(text, imageDataUrl) {
+  async sendSocialPost(text, imageDataUrl) {
     if (!text?.trim() && !imageDataUrl) return;
     const data = { text: (text||'').trim().slice(0,500) };
     if (imageDataUrl) {
@@ -203,35 +218,35 @@ class Node {
         this.ft.outgoing.set(fid, { meta, chunks });
       } catch(_) { data.image = imageDataUrl; }
     }
-    this._emit('post', data);
+    await this._emit('post', data);
     if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
   }
 
-  deleteSocialPost(postId, ownerId) { this._emit('post-delete', { ownerId }, { targetId: postId }); if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed(); }
-  likeSocialPost(postId, ownerId) {
+  async deleteSocialPost(postId, ownerId) { await this._emit('post-delete', { ownerId }, { targetId: postId }); if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed(); }
+  async likeSocialPost(postId, ownerId) {
     const post = this.state.posts.find(p => p.id === postId);
     if (!post) return;
     const has = (post.likes||[]).includes(this.id);
-    this._emit('like', { toggle: !has }, { targetId: postId });
+    await this._emit('like', { toggle: !has }, { targetId: postId });
     if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
   }
 
-  sendStory(text, bgColor, imageDataUrl) {
+  async sendStory(text, bgColor, imageDataUrl) {
     if (!text?.trim() && !imageDataUrl) return;
     const data = { text: (text||'').trim().slice(0,280), bgColor: bgColor||'#22d3ee', senderEmoji: this.profile.emoji, expiresAt: Date.now()+24*3600000, storyKey: this.id+'-'+Date.now() };
     if (imageDataUrl) data.image = imageDataUrl;
-    this._emit('story', data); ui();
+    await this._emit('story', data); ui();
   }
-  deleteStory(storyKey) { this._emit('story-delete', {}, { targetId: storyKey }); ui(); }
-  pinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; this._emit('pin', { action: 'pin' }, { channel: ch, targetId: msgId }); renderChannel(); }
-  unpinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; this._emit('pin', { action: 'unpin' }, { channel: ch, targetId: msgId }); renderChannel(); }
-  updateProfile(data) {
+  async deleteStory(storyKey) { await this._emit('story-delete', {}, { targetId: storyKey }); ui(); }
+  async pinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; await this._emit('pin', { action: 'pin' }, { channel: ch, targetId: msgId }); renderChannel(); }
+  async unpinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; await this._emit('pin', { action: 'unpin' }, { channel: ch, targetId: msgId }); renderChannel(); }
+  async updateProfile(data) {
     if (data.bio !== undefined) this.profile.bio = data.bio.slice(0,150);
     if (data.status !== undefined) this.profile.status = data.status;
     if (data.emoji !== undefined) this.profile.emoji = data.emoji;
     if (data.avatar !== undefined) this.profile.avatar = data.avatar;
     DB.setKey('profile', this.profile);
-    this._emit('profile', { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar });
+    await this._emit('profile', { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar });
   }
 
   async sendFile(file) {
@@ -254,7 +269,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.6'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.7'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
@@ -517,7 +532,7 @@ class Node {
   isMuted(ch) { return this.mutedChannels.has(ch); }
   setSlowMode(ch, sec) { if (!this.mod.isAdmin) return; if (!this._slowMode) this._slowMode = {}; this._slowMode[ch] = sec; DB.setKey('slowMode', this._slowMode); for (const [pid] of this.peers) this.sendTo(pid, { type: 'slow-mode', channel: ch, seconds: sec }); }
   getSlowMode(ch) { return this._slowMode?.[ch]||0; }
-  setBroadcast(ch, on) { if (!this.mod.isAdmin) return; if (on) this.broadcastChannels.add(ch); else this.broadcastChannels.delete(ch); DB.setKey('broadcastChannels', [...this.broadcastChannels]); this._emit('msg', { text: '📢 ' + ch + ' is now ' + (on?'broadcast-only':'open to all'), hops: 0 }, { channel: ch }); }
+  async setBroadcast(ch, on) { if (!this.mod.isAdmin) return; if (on) this.broadcastChannels.add(ch); else this.broadcastChannels.delete(ch); DB.setKey('broadcastChannels', [...this.broadcastChannels]); await this._emit('msg', { text: '📢 ' + ch + ' is now ' + (on?'broadcast-only':'open to all'), hops: 0 }, { channel: ch }); }
   isBroadcast(ch) { return this.broadcastChannels.has(ch); }
   canWrite(ch) { if (!this.isBroadcast(ch)) return true; return this.mod.isAdmin||this.mod.isMod; }
   getBadges(pid) { const b = []; if (this.mod.admins.has(pid)) b.push({ icon: '🛡️', label: 'Admin' }); if (this.mod.mods.has(pid)) b.push({ icon: '⚔️', label: 'Mod' }); const ha = Date.now()-3600000; if (this.state.getAll().filter(m => m.senderId===pid&&m.ts>ha).length>=10) b.push({ icon: '⚡', label: 'Active' }); const p = this.peers.get(pid); if (p&&Date.now()-(this.trust.firstSeen?.[pid]||p.seen)<3600000) b.push({ icon: '🆕', label: 'New' }); return b; }
