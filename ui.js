@@ -1170,11 +1170,8 @@ function editTopic() {
   if (t === null) return;
   channelTopics[ch] = t.slice(0, 200);
   DB.setKey('channelTopics', channelTopics);
-  // Broadcast topic to peers
-  const topicMsg = { type: 'chat', msgId: `topic-${Date.now()}`, sender: N.name, senderId: N.id, text: `📝 Topic set: ${t.slice(0,200) || '(cleared)'}`, ts: Date.now(), hops: 0, channel: ch, lamport: N.clock.tick() };
-  N.gossip.mark(topicMsg.msgId);
-  N.store.add({ ...topicMsg, _verified: true });
-  for (const [pid] of N.peers) N.sendTo(pid, topicMsg);
+  // Broadcast topic via ActionLog
+  N.sendChat(`📝 Topic set: ${t.slice(0,200) || '(cleared)'}`);
   renderChannel();
 }
 
@@ -1414,14 +1411,12 @@ function sharePostToChannel(postId, ownerName, preview) {
   const goToPlaza = (e) => {
     e.stopPropagation();
     e.preventDefault();
-    // Switch to Plaza tab and scroll to post
     document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
     document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
     const plazaTab = document.querySelector('.stab[data-t="plaza"]');
     if (plazaTab) plazaTab.classList.add('on');
     document.getElementById('pnPlaza')?.classList.add('on');
     refreshPlaza();
-    // Open mobile sidebar if needed
     const sb = document.querySelector('.sidebar');
     if (sb && window.innerWidth <= 700) {
       sb.classList.add('mob-open');
@@ -1444,19 +1439,17 @@ function sharePostToChannel(postId, ownerName, preview) {
   el.appendChild(card);
   el.scrollTop = el.scrollHeight;
 
-  // Auto-remove after 15 seconds
+  // Auto-remove after 5 minutes
   setTimeout(() => {
     card.style.transition = 'opacity 0.5s, max-height 0.5s';
     card.style.opacity = '0';
     card.style.maxHeight = '0';
     card.style.overflow = 'hidden';
     setTimeout(() => card.remove(), 600);
-  }, 15000);
+  }, 5 * 60 * 1000);
 
-  // Also broadcast to peers so they see the card
-  for (const [pid] of N.peers) {
-    N.sendTo(pid, { type: 'chat', msgId: `share-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, sender: N.name, senderId: N.id, text: `🏛️ shared a Plaza post → tap to view`, ts: Date.now(), hops: 0, channel: N.chMgr.current, lamport: N.clock.tick(), _plazaShare: { postId, ownerName, preview } });
-  }
+  // Broadcast via ActionLog so all peers see it
+  N.sendChat(`🏛️ shared: ${ownerName} — "${preview}" → #plaza/${postId}`);
   showToastSimple('Shared to channel!');
 }
 
