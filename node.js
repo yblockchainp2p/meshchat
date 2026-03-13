@@ -102,6 +102,7 @@ class Node {
     action.sig = await this.crypto.sign({ id: action.id, type: action.type, data: action.data, ts: action.ts, senderId: action.senderId });
     this.gossip.mark(action.id);
     this.actionLog.add(action);
+    console.log('EMIT', type, action.id.slice(0,12), 'to', this.peers.size, 'peers');
     for (const [pid] of this.peers) this.sendTo(pid, { type: 'action', action, hops: 0 });
     return action;
   }
@@ -372,15 +373,17 @@ class Node {
 
   // ═══ ACTION LOG PROTOCOL ═══
   _onAction(d, from) {
-    const a = d.action; if (!a?.id) return;
-    if (this.gossip.has(a.id)) return; this.gossip.mark(a.id);
-    if (this.blocked.has(a.senderId)) return;
+    const a = d.action; if (!a?.id) { console.warn('Action: no id'); return; }
+    if (this.gossip.has(a.id)) { console.log('Action DUP:', a.id.slice(0,12)); return; } this.gossip.mark(a.id);
+    if (this.blocked.has(a.senderId)) { console.log('Action BLOCKED:', a.senderId.slice(0,8)); return; }
     const lt = this._lastMsgTime.get(a.senderId)||0;
-    if (Date.now()-lt < 300) return; this._lastMsgTime.set(a.senderId, Date.now());
-    if (!this.trust.shouldAccept(a.senderId)) return;
+    if (Date.now()-lt < 300) { console.log('Action FLOOD:', a.senderId.slice(0,8)); return; } this._lastMsgTime.set(a.senderId, Date.now());
+    if (!this.trust.shouldAccept(a.senderId)) { console.log('Action TRUST REJECT:', a.senderId.slice(0,8), 'score:', this.trust.getScore(a.senderId)); return; }
     // DM decrypt
     if (a.type==='msg' && a.data?.encrypted && a.data?.targetId===this.id) { this._decryptDM(a, from); return; }
-    if (this.actionLog.add(a)) {
+    const added = this.actionLog.add(a);
+    console.log('Action', a.type, a.id.slice(0,12), 'added:', added, 'from:', from.slice(0,8));
+    if (added) {
       this.trust.onMessageReceived(a.senderId);
       if (from!==a.senderId) this.trust.onRelay(from);
       if (a.data?.text) { const sc = this.mod.scanText(a.data.text); if (sc.flagged) this._autoReport({ sender: a.senderName, senderId: a.senderId, text: a.data.text, channel: a.channel, ts: a.ts }, sc.reason); }
@@ -444,8 +447,9 @@ class Node {
     if (Array.isArray(d.fileHaves)) { for (const t of d.fileHaves) this.ft.addSeeder(t, sid); }
     // Chain sync
     const theirL = d.syncLamport||0, myL = this.actionLog.clock.time;
+    console.log('Handshake sync:', 'myLamport:', myL, 'theirLamport:', theirL, 'myActions:', this.actionLog.size);
     if (theirL > myL) this.sendTo(from, { type: 'chain-sync-request', sinceLamport: myL });
-    if (myL > theirL) { const m = this.actionLog.getSince(theirL); for (let i = 0; i < m.length; i += 200) this.sendTo(from, { type: 'chain-sync', actions: m.slice(i, i+200), total: m.length }); }
+    if (myL > theirL) { const m = this.actionLog.getSince(theirL); console.log('Sending', m.length, 'actions to', from.slice(0,8)); for (let i = 0; i < m.length; i += 200) this.sendTo(from, { type: 'chain-sync', actions: m.slice(i, i+200), total: m.length }); }
     if (this.mod.admins.has(sid)||this.mod.mods.has(sid)) setTimeout(() => this._flushToAdmin(from), 300);
     ui();
   }
