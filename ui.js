@@ -1864,11 +1864,13 @@ function refreshPlazaFeed() {
   const el = document.getElementById('plazaFeed');
   if (!el) return;
 
-  // Collect all posts from all users
+  // Collect all posts from all users (dedup by ID)
   const allPosts = [];
-  for (const p of (N.profile.posts || [])) allPosts.push(p);
+  const seenPostIds = new Set();
+  const addPost = (p) => { if (p.id && !seenPostIds.has(p.id)) { seenPostIds.add(p.id); allPosts.push(p); } };
+  for (const p of (N.profile.posts || [])) addPost(p);
   for (const [, prof] of N.peerProfiles) {
-    for (const p of (prof.posts || [])) allPosts.push(p);
+    for (const p of (prof.posts || [])) addPost(p);
   }
   allPosts.sort((a, b) => b.ts - a.ts);
 

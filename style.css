@@ -471,7 +471,7 @@ html,body{height:100%;overflow:hidden;font-family:var(--body);background:var(--b
 .live-compose{padding:10px 12px;border-bottom:1px solid var(--brd);}
 .live-input{width:100%;background:var(--bg1);border:1px solid var(--brd);border-radius:8px;padding:8px 10px;color:var(--t1);font-size:12px;font-family:var(--body);outline:none;resize:none;box-sizing:border-box;}
 
-.live-post{padding:12px;border-bottom:1px solid var(--brd);transition:background 0.12s;}
+.live-post{padding:12px;transition:background 0.12s;}
 .live-post:hover{background:rgba(34,211,238,0.02);}
 .live-post-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
 .live-post-avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;}
