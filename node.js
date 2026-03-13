@@ -1,40 +1,34 @@
 // ═══════════════════════════════════════
-// 7. MAIN NODE
+// MeshChat v1.1.6 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
     this.id = null; this.name = ''; this.ws = null;
     this.crypto = new CryptoId();
-    this.rt = null; this.gossip = new Gossip(); this.store = new MsgStore();
+    this.rt = null; this.gossip = new Gossip();
     this.chMgr = new ChannelMgr(); this.clock = new LamportClock();
     this.peers = new Map(); this.pending = new Map();
-    this.peerKeys = new Map(); // peerId -> { sign: jwk, dh: jwk }
-    this.dmSecrets = new Map(); // peerId -> AES-GCM CryptoKey
+    this.peerKeys = new Map(); this.dmSecrets = new Map();
     this.ice = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
     this.gCnt = 0;
-    this.trust = new TrustEngine();
-    this.mod = new ModerationEngine();
-    this.ft = new FileTransfer();
-    this.genesis = new NetworkGenesis();
-    this.reactions = new Map(); // msgId -> { emoji: [senderId, ...] }
-    this.blocked = new Set(); // blocked user IDs (local only)
-    this.bookmarks = []; // [{ msgId, text, sender, ts }]
-    this._lastMsgTime = new Map(); // senderId -> timestamp (anti-flood)
-    this.mutedChannels = new Set(); // muted channel names (no notifications)
-    this.pendingAdminQueue = []; // messages waiting for admin to come online
-    // ── Social features (v21) ──
-    this.profile = { bio: '', status: 'online', emoji: '', posts: [] }; // own profile
-    this.peerProfiles = new Map(); // peerId -> { bio, status, emoji, posts }
-    this.stories = new Map(); // oderId -> { text, bgColor, ts, expiresAt }
-    this.typing = new Map(); // channel -> Map(peerId -> { name, ts })
-    this.pins = {}; // channel -> [msgId, ...]
-    this.broadcastChannels = new Set(); // channels in broadcast mode
-    this.readReceipts = new Map(); // msgId -> { delivered: bool, read: bool }
-    this.relayPeers = new Map(); // targetId -> relayPeerId
-    this._relayCount = 0; // rate limit counter
-    this._relayResetTimer = null;
-    // ── Tombstones (v1.1.6) — deleted item IDs survive reconnect ──
-    this.tombstones = new Map(); // id -> { ts, type } — deleted msgIds, postIds, storyKeys
+    this.trust = new TrustEngine(); this.mod = new ModerationEngine();
+    this.ft = new FileTransfer(); this.genesis = new NetworkGenesis();
+    this.blocked = new Set(); this.bookmarks = [];
+    this._lastMsgTime = new Map(); this.mutedChannels = new Set();
+    this.pendingAdminQueue = [];
+    this.typing = new Map(); this.readReceipts = new Map();
+    this.broadcastChannels = new Set();
+    this.relayPeers = new Map(); this._relayCount = 0; this._relayResetTimer = null;
+    // ActionLog
+    this.actionLog = new ActionLog();
+    this.chain = null;
+    this.state = new StateBuilder(this.actionLog);
+    this.store = this.state;
+    this.reactions = this.state.reactions;
+    this.pins = this.state.pins;
+    this.profile = { bio: '', status: 'online', emoji: '', avatar: '', posts: [] };
+    this.peerProfiles = new Map();
+    this.stories = this.state.stories;
   }
 
   async init(name) {
@@ -43,22 +37,14 @@ class Node {
     await this.crypto.init();
     this.id = await this.crypto.nodeId();
     this.rt = new RT(this.id);
-
-    // Save username
+    this.chain = new BlockChain(this.id);
     await DB.setKey('username', name);
-
-    // Clean up corrupt data from previous versions
-    await DB.cleanupCorrupt();
-
-    // Load persisted data
-    await this.store.loadFromDB();
-    await this.chMgr.loadFromDB();
-    this.chMgr.cleanup();
-    await this.trust.loadFromDB();
-    await this.mod.loadFromDB();
-    await this.genesis.loadFromDB();
-
-    // Load personal data
+    await this.actionLog.loadFromDB();
+    await this.chain.loadFromDB();
+    this.state.rebuild();
+    this._syncCompat();
+    await this.chMgr.loadFromDB(); this.chMgr.cleanup();
+    await this.trust.loadFromDB(); await this.mod.loadFromDB(); await this.genesis.loadFromDB();
     const blocked = await DB.getKey('blocked');
     if (Array.isArray(blocked)) for (const b of blocked) this.blocked.add(b);
     const bm = await DB.getKey('bookmarks');
@@ -66,2325 +52,488 @@ class Node {
     const sm = await DB.getKey('slowMode');
     if (sm && typeof sm === 'object') this._slowMode = sm;
     const dn = await DB.getKey('dmNames');
-    if (dn && typeof dn === 'object') { this._dmNames = new Map(Object.entries(dn)); }
+    if (dn && typeof dn === 'object') this._dmNames = new Map(Object.entries(dn));
     const muted = await DB.getKey('mutedChannels');
     if (Array.isArray(muted)) for (const m of muted) this.mutedChannels.add(m);
     const paq = await DB.getKey('pending:adminQueue');
     if (Array.isArray(paq)) this.pendingAdminQueue = paq;
     this._pruneAdminQueue();
-
-    // Load social profile
     const prof = await DB.getKey('profile');
     if (prof && typeof prof === 'object') Object.assign(this.profile, prof);
-    const pins = await DB.getKey('pins');
-    if (pins && typeof pins === 'object') this.pins = pins;
     const bc = await DB.getKey('broadcastChannels');
     if (Array.isArray(bc)) for (const c of bc) this.broadcastChannels.add(c);
-    const savedStories = await DB.getKey('stories');
-    if (Array.isArray(savedStories)) {
-      const now = Date.now();
-      for (const s of savedStories) {
-        if (s.expiresAt > now) this.stories.set(s.senderId + '-' + s.ts, s);
-      }
-    }
-
-    // Don't auto-assign admin here — wait for bootstrap peer list
     this.mod.checkAdmin(this.id);
-
-    // Load tombstones (v1.1.6)
-    const ts_data = await DB.getKey('tombstones');
-    if (Array.isArray(ts_data)) {
-      const cutoff = Date.now() - 48 * 3600 * 1000; // 48h TTL
-      for (const t of ts_data) {
-        if (t.ts > cutoff) this.tombstones.set(t.id, { ts: t.ts, type: t.type });
-      }
-    }
-    // Apply tombstones to loaded data — remove anything that was deleted while we were offline
-    this._applyTombstones();
-
-    // Restore Lamport clock from stored messages
-    for (const m of this.store.getAll()) {
-      if (m.lamport > this.clock.time) this.clock.time = m.lamport;
-      this.gossip.mark(m.msgId);
-    }
-
+    this.clock.time = this.actionLog.clock.time;
+    for (const [id] of this.actionLog.actions) this.gossip.mark(id);
+    for (const [ch] of this.state.messages) this.chMgr.joined.add(ch);
+    this.actionLog.on((a) => { this.state.applyIncremental(a); this._syncCompat(); });
+    this.chain.startClosing(this.actionLog);
+    setInterval(() => this.actionLog.prune(), 600000);
     this._sessionStart = Date.now();
     this._setStatus('reconnecting');
-    this.connectBS();
-    this.startHB();
-    this.startRefresh();
-    this.startWakeDetection();
-
-    const displayId = `${name}#${this.crypto.shortId}`;
-    sys(`🔑 ${displayId}${this.mod.isAdmin ? ' · 🛡️ Admin' : ''}`);
-
-    // Update identity badge
-    document.getElementById('idBadge').textContent = displayId;
-    document.getElementById('idBadge').title = `Public key: ${this.crypto.pubKeyHex.slice(0, 32)}…`;
-
-    // Render stored messages for current channel
-    renderChannel();
-    refreshChannelList();
+    this.connectBS(); this.startHB(); this.startRefresh(); this.startWakeDetection();
+    const did = name + '#' + this.crypto.shortId;
+    sys('🔑 ' + did + (this.mod.isAdmin ? ' · 🛡️ Admin' : ''));
+    document.getElementById('idBadge').textContent = did;
+    document.getElementById('idBadge').title = 'Public key: ' + this.crypto.pubKeyHex.slice(0,32) + '…';
+    renderChannel(); refreshChannelList();
   }
 
-  // ── Bootstrap with aggressive reconnect ──
-  connectBS() {
-    if (this._wsConnecting) return;
-    this._wsConnecting = true;
-    try { this.ws?.close(); } catch (_) {}
-
-    this.ws = new WebSocket(BOOTSTRAP);
-    this.ws.onopen = () => {
-      this._wsConnecting = false;
-      this._wsRetry = 1;
-      this._bsFailed = false;
-      this._setStatus('connected');
-      console.log('Bootstrap connected');
-      this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name }));
-    };
-    this.ws.onmessage = (e) => { try { this.onBS(JSON.parse(e.data)); } catch (er) { console.error('WS:', er); } };
-    this.ws.onclose = () => {
-      this._wsConnecting = false;
-      this._setStatus('disconnected');
-      const delay = Math.min((this._wsRetry || 1) * 1000, 10000);
-      this._wsRetry = Math.min((this._wsRetry || 1) * 2, 10);
-      console.log(`Bootstrap lost, retry in ${delay}ms`);
-
-      // If bootstrap fails repeatedly, try peer cache
-      if (!this._bsFailed) {
-        this._bsFailed = true;
-        this._tryPeerCache();
-      }
-
-      setTimeout(() => this.connectBS(), delay);
-    };
-    this.ws.onerror = () => { this._wsConnecting = false; };
-  }
-
-  // ── Peer cache: reconnect without bootstrap ──
-  async _tryPeerCache() {
-    try {
-      const cached = await DB.getPeers();
-      if (!cached || !cached.length) return;
-
-      // Sort by most recently seen
-      cached.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
-      const candidates = cached.slice(0, 5);
-      console.log(`Bootstrap down — trying ${candidates.length} cached peer(s)`);
-
-      for (const p of candidates) {
-        if (p.id === this.id || this.peers.has(p.id) || this.pending.has(p.id)) continue;
-        // We can't initiate WebRTC without signaling, but if we have ANY connected peer,
-        // ask them to relay our signaling to the cached peer
-        if (this.peers.size > 0) {
-          this._requestPeerRelay(p.id, p.name);
-        }
-      }
-
-      // Also: if we have connected peers, we're still alive even without bootstrap
-      if (this.peers.size > 0) {
-        this._setStatus('connected');
-        console.log(`Still connected to ${this.peers.size} peer(s) without bootstrap`);
-      }
-    } catch (e) {
-      console.error('Peer cache error:', e);
-    }
-  }
-
-  // Ask a connected peer to relay signaling to a target peer
-  _requestPeerRelay(targetId, targetName) {
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'signal-relay-request', targetId, targetName, fromId: this.id, fromName: this.name });
-      console.log(`Requested relay to ${targetName || targetId.slice(0, 8)} via ${pid.slice(0, 8)}`);
-      return; // Ask one peer only
-    }
-  }
-
-  // Full reconnect — drop all dead peers, reconnect bootstrap, re-establish P2P
-  reconnect() {
-    this._setStatus('reconnecting');
-    console.log('Reconnecting...');
-    for (const [pid] of this.peers) this.drop(pid);
-    for (const [pid] of this.pending) {
-      try { this.pending.get(pid)?.pc?.close(); } catch (_) {}
-    }
-    this.pending.clear();
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.connectBS();
-    } else {
-      this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name }));
-    }
-    ui();
-  }
-
-  // Status indicator — updates the tag badge color
-  _setStatus(s) {
-    this._status = s;
-    const tag = document.getElementById('statusTag');
-    if (!tag) return;
-    tag.textContent = 'v1.1.6';
-    if (s === 'connected') tag.className = 'tag tag-on';
-    else if (s === 'reconnecting') tag.className = 'tag tag-warn';
-    else tag.className = 'tag tag-off';
-  }
-
-  // Start visibility/wake listeners
-  startWakeDetection() {
-    // Page Visibility API — fires when user switches back to tab
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        // Small delay to let network stack wake up
-        setTimeout(() => this._checkAndReconnect(), 500);
-      }
-    });
-
-    // Also detect wake via timer drift
-    // If our interval fires much later than expected, device was sleeping
-    let lastTick = Date.now();
-    setInterval(() => {
-      const now = Date.now();
-      const drift = now - lastTick;
-      lastTick = now;
-      // If more than 8s drift (expected 3s interval), we were asleep
-      if (drift > 8000) {
-        console.log(`Wake detected: ${drift}ms drift`);
-        setTimeout(() => this._checkAndReconnect(), 500);
-      }
-    }, 3000);
-
-    // Online/offline events
-    window.addEventListener('online', () => {
-      console.log('Network restored');
-      setTimeout(() => this._checkAndReconnect(), 1000);
-    });
-  }
-
-  _checkAndReconnect() {
-    // Check if bootstrap WebSocket is dead
-    const wsAlive = this.ws && this.ws.readyState === WebSocket.OPEN;
-    // Check if any peers are still alive
-    const peersAlive = [...this.peers.values()].some(p => {
-      try { return p.ch?.readyState === 'open'; } catch (_) { return false; }
-    });
-
-    if (!wsAlive || !peersAlive) {
-      this.reconnect();
-    } else {
-      // WS is open but peers might be stale — send a ping via re-register
-      // to get fresh peer list and reconnect to any new peers
-      try {
-        this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name }));
-      } catch (_) {
-        this.reconnect();
-      }
-    }
-  }
-
-  onBS(m) {
-    if (m.type === 'peers') this.onList(m.peers || []);
-    else if (m.type === 'signal') this.onSig(m);
-    else if (m.type === 'peer-joined') this.onJoin(m);
-    else if (m.type === 'peer-left') this.onLeave(m);
-  }
-
-  async onList(data) {
-    // Server may send { type:'peers', peers:[], cachedGenesis:{} }
-    const list = Array.isArray(data) ? data : (data.peers || []);
-    const others = list.filter(p => p.nodeId !== this.id);
-    console.log(`Found ${others.length} peer(s)`);
-    for (const p of others) this.rt.add({ id: p.nodeId, name: p.username });
-
-    // Genesis logic
-    if (!this.genesis.networkId && others.length === 0) {
-      // No one else online, no cached genesis → we found a new network
-      if (data.cachedGenesis && data.cachedGenesis.networkId) {
-        // Server has a cached genesis from before — adopt it
-        await this.genesis.adopt(data.cachedGenesis);
-        if (Array.isArray(data.cachedGenesis.admins)) {
-          this.mod.admins = new Set(data.cachedGenesis.admins);
-          DB.setKey('mod:admins', data.cachedGenesis.admins);
-        }
-        this.mod.checkAdmin(this.id);
-        console.log(`Reconnected to network (admin: ${this.genesis.adminName || '?'})`);
+  _syncCompat() {
+    this.reactions = this.state.reactions;
+    this.pins = this.state.pins;
+    this.stories = this.state.stories;
+    for (const [pid, p] of this.state.profiles) {
+      if (pid !== this.id) {
+        const ex = this.peerProfiles.get(pid) || {};
+        this.peerProfiles.set(pid, { ...ex, ...p, posts: this.state.getUserPosts(pid) });
       } else {
-        // Truly first peer ever → create genesis
-        await this.genesis.create(this.id, this.name, this.crypto);
-        this.mod.admins = new Set([this.id]);
-        this.mod.checkAdmin(this.id);
-        DB.setKey('mod:admins', [this.id]);
-        sys('🛡️ Network founded — you are admin');
-        // Cache genesis on server for persistence
-        this._sendToServer({ type: 'genesis-update', genesis: { ...this.genesis.toPacket(), admins: [...this.mod.admins] } });
-      }
-    } else if (!this.genesis.networkId && others.length > 0) {
-      // Peers exist but we have no genesis — we'll get it via handshake
-      if (data.cachedGenesis && data.cachedGenesis.networkId) {
-        await this.genesis.adopt(data.cachedGenesis);
-        if (Array.isArray(data.cachedGenesis.admins)) {
-          this.mod.admins = new Set(data.cachedGenesis.admins);
-          DB.setKey('mod:admins', data.cachedGenesis.admins);
-        }
-        this.mod.checkAdmin(this.id);
+        this.profile.bio = p.bio || this.profile.bio;
+        this.profile.status = p.status || this.profile.status;
+        this.profile.emoji = p.emoji || this.profile.emoji;
+        this.profile.avatar = p.avatar || this.profile.avatar;
       }
     }
-
-    this.genesis.peerCount = this.peers.size;
-
-    const tgts = this.rt.closest(this.id, CFG.MAX_PEERS);
-    for (const t of tgts) {
-      if (!this.peers.has(t.id) && !this.pending.has(t.id) && this.id < t.id)
-        this.startConn(t.id, t.name);
-    }
-    this._setStatus('connected');
-    ui();
+    this.profile.posts = this.state.getUserPosts(this.id);
   }
 
-  // Send data to bootstrap server via WebSocket
-  _sendToServer(data) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      try { this.ws.send(JSON.stringify(data)); } catch (e) { console.error('Server send:', e); }
-    }
+  async _emit(type, data, opts = {}) {
+    const action = this.actionLog.create(type, data, { senderId: this.id, senderName: this.name, channel: opts.channel, targetId: opts.targetId });
+    action.sig = await this.crypto.sign({ id: action.id, type: action.type, data: action.data, ts: action.ts, senderId: action.senderId });
+    this.gossip.mark(action.id);
+    this.actionLog.add(action);
+    for (const [pid] of this.peers) this.sendTo(pid, { type: 'action', action, hops: 0 });
+    return action;
   }
 
-  // ── REACTIONS ──
-  sendReaction(msgId, emoji) {
-    if (!msgId || !emoji) return;
-    // Toggle locally
-    if (!this.reactions.has(msgId)) this.reactions.set(msgId, {});
-    const map = this.reactions.get(msgId);
-    if (!map[emoji]) map[emoji] = [];
-    const idx = map[emoji].indexOf(this.id);
-    if (idx >= 0) map[emoji].splice(idx, 1); // Remove (toggle off)
-    else map[emoji].push(this.id);            // Add (toggle on)
-    // Clean empty
-    if (map[emoji].length === 0) delete map[emoji];
-
-    // Broadcast
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'reaction', msgId, emoji, senderId: this.id, toggle: idx < 0 });
+  async sendChat(text, replyTo) {
+    const ch = this.chMgr.current;
+    const slow = this.getSlowMode(ch);
+    if (slow > 0 && !this.mod.isAdmin && !this.mod.isMod) {
+      const last = this._lastSentTime?.[ch] || 0;
+      if (Date.now() - last < slow * 1000) { sys('⏳ Slow mode'); return; }
     }
-    renderChannel();
+    if (!this._lastSentTime) this._lastSentTime = {};
+    this._lastSentTime[ch] = Date.now();
+    if (this.chMgr.isDM(ch)) { await this.sendDM(text, ch, replyTo); return; }
+    const data = { text, hops: 0 };
+    if (replyTo) data.replyTo = replyTo;
+    const scan = this.mod.scanText(text);
+    if (scan.flagged) this._autoReport({ sender: this.name, senderId: this.id, text, channel: ch, ts: Date.now() }, scan.reason);
+    const a = await this._emit('msg', data, { channel: ch });
+    showMsg({ sender: this.name, senderId: this.id, text, time: a.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: a.id, replyTo });
+    refreshChannelList(); stats();
   }
 
-  onReaction(d, from) {
-    if (!d.msgId || !d.emoji || !d.senderId) return;
-    if (!this.reactions.has(d.msgId)) this.reactions.set(d.msgId, {});
-    const map = this.reactions.get(d.msgId);
-    if (!map[d.emoji]) map[d.emoji] = [];
-    const idx = map[d.emoji].indexOf(d.senderId);
-    if (d.toggle && idx < 0) map[d.emoji].push(d.senderId);
-    else if (!d.toggle && idx >= 0) map[d.emoji].splice(idx, 1);
-    if (map[d.emoji].length === 0) delete map[d.emoji];
-    // Forward
-    const fwd = { ...d, hops: (d.hops || 0) + 1 };
-    if ((fwd.hops || 0) < 3) {
-      const tgts = this.gossip.pick([...this.peers.values()].map(p => p.info), [from, d.senderId]);
-      for (const t of tgts) this.sendTo(t.id, fwd);
-    }
-    scheduleRender();
+  async sendDM(text, dmChannel, replyTo) {
+    const parts = dmChannel.replace('dm:', '').split('-');
+    let peerId = null;
+    for (const [id] of this.peers) { if (parts.includes(id.slice(0,8))) { peerId = id; break; } }
+    if (!peerId) for (const [id] of this.dmSecrets) { if (parts.includes(id.slice(0,8))) { peerId = id; break; } }
+    const secret = peerId ? this.dmSecrets.get(peerId) : null;
+    if (!secret) { sys('⚠ No encryption key'); return; }
+    const encrypted = await this.crypto.encrypt(text, secret);
+    const data = { text, encrypted, targetId: peerId, isDM: true, hops: 0 };
+    if (replyTo) data.replyTo = replyTo;
+    const a = await this._emit('msg', data, { channel: dmChannel });
+    showMsg({ sender: this.name, senderId: this.id, text, time: a.ts, route: 'e2e', hops: 0, self: true, channel: dmChannel, verified: true, dm: true, msgId: a.id, replyTo });
+    refreshChannelList(); stats();
   }
 
-  // ── DELETE / EDIT MESSAGES ──
   async deleteMessage(msgId) {
-    const all = this.store.getAll();
-    const msg = all.find(m => m.msgId === msgId);
+    const msg = this.state.getAll().find(m => m.msgId === msgId);
     if (!msg) return;
-    // Allow own messages OR admin/mod can delete anyone's
     if (msg.senderId !== this.id && !this.mod.isAdmin && !this.mod.isMod) return;
-    // Clean up file cache if it's an image
-    if (msg.fileMeta?.transferId) {
-      const tid = msg.fileMeta.transferId;
-      this.ft.fileCache.delete(tid);
-      this.ft.outgoing.delete(tid);
-      this.mod.approvedMedia.delete(tid);
-      this.mod.rejectedMedia.delete(tid);
-      this.mod.mediaQueue.delete(tid);
-      if (window._fileUrls?.[tid]) {
-        URL.revokeObjectURL(window._fileUrls[tid].url);
-        delete window._fileUrls[tid];
-      }
-    }
-    this.store.deleteMsg(msgId);
-    this.reactions.delete(msgId);
-    this._addTombstone(msgId, 'msg');
-    const d = { type: 'delete-msg', msgId, senderId: this.id, deletedBy: this.id, ts: Date.now(), transferId: msg.fileMeta?.transferId || null };
-    d.sig = await this.crypto.sign(d);
-    for (const [pid] of this.peers) this.sendTo(pid, d);
+    if (msg.fileMeta?.transferId) this._cleanFile(msg.fileMeta.transferId);
+    await this._emit('delete', {}, { targetId: msgId, channel: msg.channel });
     scheduleRender();
-  }
-
-  onDeleteMsg(d, from) {
-    if (!d.msgId) return;
-    const msg = this.store.getAll().find(m => m.msgId === d.msgId);
-    // Allow if sender deletes own OR admin/mod deletes
-    const isAdminDelete = this.mod.admins.has(d.deletedBy) || this.mod.mods.has(d.deletedBy);
-    if (msg) {
-      const isOwner = msg.senderId === d.senderId;
-      if (!isOwner && !isAdminDelete) return;
-    } else if (!isAdminDelete) {
-      // No message found and not admin delete — just record tombstone and forward
-      this._addTombstone(d.msgId, 'msg');
-      const fwd = { ...d, hops: (d.hops || 0) + 1 };
-      if ((fwd.hops || 0) < CFG.TTL) {
-        for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
-      }
-      return;
-    }
-    // Clean up file — use msg.fileMeta or d.transferId from broadcast
-    const tid = msg?.fileMeta?.transferId || d.transferId;
-    if (tid) {
-      this.ft.fileCache.delete(tid);
-      this.ft.outgoing.delete(tid);
-      this.mod.approvedMedia.delete(tid);
-      this.mod.rejectedMedia.delete(tid);
-      this.mod.mediaQueue.delete(tid);
-      if (window._fileUrls?.[tid]) {
-        try { URL.revokeObjectURL(window._fileUrls[tid].url); } catch (_) {}
-        delete window._fileUrls[tid];
-      }
-    }
-    this.store.deleteMsg(d.msgId);
-    this.reactions.delete(d.msgId);
-    this._addTombstone(d.msgId, 'msg');
-    const fwd = { ...d, hops: (d.hops || 0) + 1 };
-    if ((fwd.hops || 0) < CFG.TTL) {
-      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
-    }
-    renderChannel();
   }
 
   async editMessage(msgId, newText) {
-    const all = this.store.getAll();
-    const msg = all.find(m => m.msgId === msgId);
+    const msg = this.state.getAll().find(m => m.msgId === msgId);
     if (!msg || msg.senderId !== this.id) return;
-    msg.text = newText;
-    msg._edited = true;
-    DB.saveMsg(msg);
-    const d = { type: 'edit-msg', msgId, senderId: this.id, newText, ts: Date.now() };
-    d.sig = await this.crypto.sign(d);
-    for (const [pid] of this.peers) this.sendTo(pid, d);
+    await this._emit('edit', { newText }, { targetId: msgId, channel: msg.channel });
     scheduleRender();
   }
 
   async forwardMessage(msgId, targetChannel) {
-    const msg = this.store.getAll().find(m => m.msgId === msgId);
+    const msg = this.state.getAll().find(m => m.msgId === msgId);
     if (!msg) return;
-    const fwdText = `↗ ${msg.sender}: ${msg.text}`;
-    this.chMgr.switchTo(targetChannel);
-    this.chMgr.current = targetChannel;
-    await this.sendChat(fwdText);
-    scheduleRender();
-    refreshChannelList();
+    this.chMgr.switchTo(targetChannel); this.chMgr.current = targetChannel;
+    await this.sendChat('↗ ' + msg.sender + ': ' + msg.text);
   }
 
-  // ── BLOCK / UNBLOCK ──
-  blockUser(userId) {
-    this.blocked.add(userId);
-    DB.setKey('blocked', [...this.blocked]);
+  sendReaction(msgId, emoji) {
+    if (!msgId || !emoji) return;
+    const rm = this.state.reactions.get(msgId) || {};
+    const has = (rm[emoji] || []).includes(this.id);
+    this._emit('reaction', { emoji, toggle: !has }, { targetId: msgId });
+    renderChannel();
   }
 
-  unblockUser(userId) {
-    this.blocked.delete(userId);
-    DB.setKey('blocked', [...this.blocked]);
-  }
-
-  isBlocked(userId) { return this.blocked.has(userId); }
-
-  // ── BOOKMARKS ──
-  addBookmark(msgId) {
-    const msg = this.store.getAll().find(m => m.msgId === msgId);
-    if (!msg || this.bookmarks.some(b => b.msgId === msgId)) return;
-    this.bookmarks.push({ msgId, text: msg.text, sender: msg.sender, channel: msg.channel, ts: msg.ts });
-    if (this.bookmarks.length > 50) this.bookmarks.shift();
-    DB.setKey('bookmarks', this.bookmarks);
-  }
-
-  removeBookmark(msgId) {
-    this.bookmarks = this.bookmarks.filter(b => b.msgId !== msgId);
-    DB.setKey('bookmarks', this.bookmarks);
-  }
-
-  // ── MUTE/UNMUTE CHANNELS ──
-  muteChannel(ch) { this.mutedChannels.add(ch); DB.setKey('mutedChannels', [...this.mutedChannels]); }
-  unmuteChannel(ch) { this.mutedChannels.delete(ch); DB.setKey('mutedChannels', [...this.mutedChannels]); }
-  isMuted(ch) { return this.mutedChannels.has(ch); }
-
-  // ── POLL SYSTEM ──
   sendPoll(question, options) {
     const ch = this.chMgr.current;
-    const pollId = `poll-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const lamport = this.clock.tick();
-    const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const d = {
-      type: 'chat', msgId, sender: this.name, senderId: this.id,
-      text: `📊 ${question}`, ts: Date.now(), hops: 0, channel: ch, lamport,
-      poll: { id: pollId, question, options: options.map(o => ({ text: o, votes: [] })) },
-    };
-    this.gossip.mark(msgId);
-    this.store.add({ ...d, _verified: true });
-    showMsg({ sender: this.name, senderId: this.id, text: d.text, time: d.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId, poll: d.poll });
-    for (const [pid] of this.peers) this.sendTo(pid, d);
+    const poll = { question, options: options.map(o => ({ text: o, votes: [] })) };
+    this._emit('msg', { text: '📊 ' + question, poll, hops: 0 }, { channel: ch });
     refreshChannelList();
   }
 
-  votePoll(msgId, optIdx) {
-    const msg = this.store.getAll().find(m => m.msgId === msgId);
-    if (!msg?.poll) return;
-    for (const opt of msg.poll.options) { opt.votes = opt.votes.filter(v => v !== this.id); }
-    if (msg.poll.options[optIdx]) { msg.poll.options[optIdx].votes.push(this.id); }
-    DB.saveMsg(msg);
+  votePoll(msgId, optIdx) { this._emit('poll-vote', { optIdx }, { targetId: msgId }); renderChannel(); }
+
+  sendSocialPost(text, imageDataUrl) {
+    if (!text?.trim() && !imageDataUrl) return;
+    const data = { text: (text||'').trim().slice(0,500) };
+    if (imageDataUrl) {
+      const fid = 'plaza-' + Date.now() + '-' + Math.random().toString(36).slice(2,6);
+      data.imageId = fid; data.thumb = imageDataUrl;
+      try {
+        const bin = atob(imageDataUrl.split(',')[1]);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        const meta = { transferId: fid, fileName: 'plaza.jpg', fileSize: bytes.length, fileType: 'image/jpeg', totalChunks: Math.ceil(bytes.length/16384), thumb: '' };
+        this.ft.fileCache.set(fid, { blob, meta }); this.ft._cacheToDB(fid, bytes, meta);
+        const chunks = [];
+        for (let i = 0; i < meta.totalChunks; i++) {
+          const s = i*16384, e = Math.min(s+16384, bytes.length), sl = bytes.slice(s,e);
+          let b = ''; for (let j = 0; j < sl.length; j++) b += String.fromCharCode(sl[j]);
+          chunks.push(btoa(b));
+        }
+        this.ft.outgoing.set(fid, { meta, chunks });
+      } catch(_) { data.image = imageDataUrl; }
+    }
+    this._emit('post', data);
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  deleteSocialPost(postId, ownerId) { this._emit('post-delete', { ownerId }, { targetId: postId }); if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed(); }
+  likeSocialPost(postId, ownerId) {
+    const post = this.state.posts.find(p => p.id === postId);
+    if (!post) return;
+    const has = (post.likes||[]).includes(this.id);
+    this._emit('like', { toggle: !has }, { targetId: postId });
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+  }
+
+  sendStory(text, bgColor, imageDataUrl) {
+    if (!text?.trim() && !imageDataUrl) return;
+    const data = { text: (text||'').trim().slice(0,280), bgColor: bgColor||'#22d3ee', senderEmoji: this.profile.emoji, expiresAt: Date.now()+24*3600000, storyKey: this.id+'-'+Date.now() };
+    if (imageDataUrl) data.image = imageDataUrl;
+    this._emit('story', data); ui();
+  }
+  deleteStory(storyKey) { this._emit('story-delete', {}, { targetId: storyKey }); ui(); }
+  pinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; this._emit('pin', { action: 'pin' }, { channel: ch, targetId: msgId }); renderChannel(); }
+  unpinMessage(ch, msgId) { if (!this.mod.isAdmin && !this.mod.isMod) return; this._emit('pin', { action: 'unpin' }, { channel: ch, targetId: msgId }); renderChannel(); }
+  updateProfile(data) {
+    if (data.bio !== undefined) this.profile.bio = data.bio.slice(0,150);
+    if (data.status !== undefined) this.profile.status = data.status;
+    if (data.emoji !== undefined) this.profile.emoji = data.emoji;
+    if (data.avatar !== undefined) this.profile.avatar = data.avatar;
+    DB.setKey('profile', this.profile);
+    this._emit('profile', { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar });
+  }
+
+  async sendFile(file) {
+    const ch = this.chMgr.current;
+    const result = await this.ft.prepareFile(file);
+    if (result.error) { sys('⚠ ' + result.error); return; }
+    const { meta, chunks } = result;
+    window._fileUrls = window._fileUrls || {};
+    window._fileUrls[meta.transferId] = { url: URL.createObjectURL(file), meta };
+    this.mod.registerMedia(meta.transferId, this.name, this.id, ch, meta.thumb);
+    if (this.mod.isAdmin || this.mod.isMod) this.mod.approveMedia(meta.transferId);
+    const a = await this._emit('msg', { text: '', fileMeta: meta, hops: 0 }, { channel: ch });
+    const isApproved = this.mod.approvedMedia.has(meta.transferId);
     for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'poll-vote', msgId, optIdx, voterId: this.id, hops: 0 });
+      this.sendTo(pid, { type: 'file-meta', meta, sender: this.name, senderId: this.id, channel: ch, msgId: a.id, approved: isApproved });
+      for (let i = 0; i < chunks.length; i++) this.sendTo(pid, { type: 'file-chunk', transferId: meta.transferId, index: i, data: chunks[i], meta });
     }
-    renderChannel();
+    showMsg({ sender: this.name, senderId: this.id, text: '', time: a.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: a.id, fileMeta: meta });
+    refreshChannelList(); stats();
   }
 
-  onPollVote(d, from) {
-    if (!d.msgId || d.optIdx === undefined || !d.voterId) return;
-    const msg = this.store.getAll().find(m => m.msgId === d.msgId);
-    if (!msg?.poll) return;
-    for (const opt of msg.poll.options) { opt.votes = opt.votes.filter(v => v !== d.voterId); }
-    if (msg.poll.options[d.optIdx]) { msg.poll.options[d.optIdx].votes.push(d.voterId); }
-    DB.saveMsg(msg);
-    // Forward
-    const fwd = { ...d, hops: (d.hops || 0) + 1 };
-    if (fwd.hops < 3) { for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); } }
-    renderChannel();
+  // ═══ BOOTSTRAP + WEBRTC ═══
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.6'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  startWakeDetection() {
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
+    let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
+    window.addEventListener('online', () => setTimeout(() => this._checkAndReconnect(), 1000));
   }
-
-  // ── SLOW MODE (admin sets per-channel delay in seconds) ──
-  setSlowMode(channel, seconds) {
-    if (!this.mod.isAdmin) return;
-    if (!this._slowMode) this._slowMode = {};
-    this._slowMode[channel] = seconds;
-    DB.setKey('slowMode', this._slowMode);
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'slow-mode', channel, seconds });
-    }
+  _checkAndReconnect() {
+    const ws = this.ws && this.ws.readyState === WebSocket.OPEN;
+    const pa = [...this.peers.values()].some(p => { try { return p.ch?.readyState === 'open'; } catch(_) { return false; } });
+    if (!ws || !pa) this.reconnect();
+    else { try { this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name })); } catch(_) { this.reconnect(); } }
   }
-
-  getSlowMode(channel) {
-    return this._slowMode?.[channel] || 0;
+  connectBS() {
+    if (this._wsConnecting) return; this._wsConnecting = true;
+    try { this.ws?.close(); } catch(_) {}
+    this.ws = new WebSocket(BOOTSTRAP);
+    this.ws.onopen = () => { this._wsConnecting = false; this._wsRetry = 1; this._bsFailed = false; this._setStatus('connected'); this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name })); };
+    this.ws.onmessage = (e) => { try { this.onBS(JSON.parse(e.data)); } catch(er) { console.error('WS:', er); } };
+    this.ws.onclose = () => { this._wsConnecting = false; this._setStatus('disconnected'); const d = Math.min((this._wsRetry||1)*1000,10000); this._wsRetry = Math.min((this._wsRetry||1)*2,10); if (!this._bsFailed) { this._bsFailed = true; this._tryPeerCache(); } setTimeout(() => this.connectBS(), d); };
+    this.ws.onerror = () => { this._wsConnecting = false; };
   }
-
-  onEditMsg(d, from) {
-    if (!d.msgId || !d.senderId || !d.newText) return;
-    const msg = this.store.getAll().find(m => m.msgId === d.msgId);
-    if (msg && msg.senderId === d.senderId) {
-      msg.text = d.newText;
-      msg._edited = true;
-      DB.saveMsg(msg);
-      const fwd = { ...d, hops: (d.hops || 0) + 1 };
-      if ((fwd.hops || 0) < CFG.TTL) {
-        for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, fwd); }
-      }
-      scheduleRender();
-    }
+  async _tryPeerCache() { try { const c = await DB.getPeers(); if (!c?.length) return; c.sort((a,b) => (b.lastSeen||0)-(a.lastSeen||0)); for (const p of c.slice(0,5)) { if (p.id===this.id||this.peers.has(p.id)||this.pending.has(p.id)) continue; if (this.peers.size>0) this._requestPeerRelay(p.id, p.name); } if (this.peers.size>0) this._setStatus('connected'); } catch(_) {} }
+  _requestPeerRelay(tid, tn) { for (const [pid] of this.peers) { this.sendTo(pid, { type: 'signal-relay-request', targetId: tid, targetName: tn, fromId: this.id, fromName: this.name }); return; } }
+  reconnect() { this._setStatus('reconnecting'); for (const [pid] of this.peers) this.drop(pid); for (const [pid] of this.pending) { try { this.pending.get(pid)?.pc?.close(); } catch(_) {} } this.pending.clear(); if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectBS(); else this.ws.send(JSON.stringify({ type: 'register', nodeId: this.id, username: this.name })); ui(); }
+  onBS(m) { if (m.type==='peers') this.onList(m.peers||[],m); else if (m.type==='signal') this.onSig(m); else if (m.type==='peer-joined') this.onJoin(m); else if (m.type==='peer-left') this.onLeave(m); }
+  async onList(data, fm) {
+    const list = Array.isArray(data)?data:(data.peers||[]); const others = list.filter(p => p.nodeId!==this.id);
+    for (const p of others) this.rt.add({ id: p.nodeId, name: p.username });
+    if (!this.genesis.networkId && others.length===0) {
+      if (fm?.cachedGenesis?.networkId) { await this.genesis.adopt(fm.cachedGenesis); if (Array.isArray(fm.cachedGenesis.admins)) { this.mod.admins = new Set(fm.cachedGenesis.admins); DB.setKey('mod:admins', fm.cachedGenesis.admins); } this.mod.checkAdmin(this.id); }
+      else { await this.genesis.create(this.id, this.name, this.crypto); this.mod.admins = new Set([this.id]); this.mod.checkAdmin(this.id); DB.setKey('mod:admins', [this.id]); sys('🛡️ Network founded — you are admin'); this._sendToServer({ type: 'genesis-update', genesis: { ...this.genesis.toPacket(), admins: [...this.mod.admins] } }); }
+    } else if (!this.genesis.networkId && others.length>0 && fm?.cachedGenesis?.networkId) { await this.genesis.adopt(fm.cachedGenesis); if (Array.isArray(fm.cachedGenesis.admins)) { this.mod.admins = new Set(fm.cachedGenesis.admins); DB.setKey('mod:admins', fm.cachedGenesis.admins); } this.mod.checkAdmin(this.id); }
+    this.genesis.peerCount = this.peers.size;
+    const tgts = this.rt.closest(this.id, CFG.MAX_PEERS);
+    for (const t of tgts) { if (!this.peers.has(t.id) && !this.pending.has(t.id) && this.id < t.id) this.startConn(t.id, t.name); }
+    this._setStatus('connected'); ui();
   }
-
-  // ── PIN MESSAGES ──
-  onJoin(m) {
-    if (m.nodeId === this.id) return;
-    this.rt.add({ id: m.nodeId, name: m.username });
-    if (this.peers.size < CFG.MAX_PEERS && !this.peers.has(m.nodeId) && !this.pending.has(m.nodeId)) {
-      if (this.id < m.nodeId) this.startConn(m.nodeId, m.username);
-    }
-    console.log(`${m.username} joined`);
-    ui();
-  }
-
-  onLeave(m) { this.rt.rm(m.nodeId); this.drop(m.nodeId); console.log('Peer left'); ui(); }
-
-  // ── WebRTC ──
+  _sendToServer(d) { if (this.ws?.readyState===WebSocket.OPEN) try { this.ws.send(JSON.stringify(d)); } catch(_) {} }
+  onJoin(m) { if (m.nodeId===this.id) return; this.rt.add({ id: m.nodeId, name: m.username }); if (this.peers.size < CFG.MAX_PEERS && !this.peers.has(m.nodeId) && !this.pending.has(m.nodeId) && this.id < m.nodeId) this.startConn(m.nodeId, m.username); ui(); }
+  onLeave(m) { this.rt.rm(m.nodeId); this.drop(m.nodeId); ui(); }
   startConn(tid, tn) {
-    if (this.peers.has(tid) || this.pending.has(tid)) return;
-    const pc = new RTCPeerConnection(this.ice);
-    this.pending.set(tid, { pc, name: tn, role: 'init' });
-    const ch = pc.createDataChannel('mesh', { ordered: true });
-    this.wireCh(ch, tid, tn);
+    if (this.peers.has(tid)||this.pending.has(tid)) return;
+    const pc = new RTCPeerConnection(this.ice); this.pending.set(tid, { pc, name: tn, role: 'init' });
+    const ch = pc.createDataChannel('mesh', { ordered: true }); this.wireCh(ch, tid, tn);
     pc.onicecandidate = (e) => { if (e.candidate) this.sig(tid, { type: 'candidate', candidate: e.candidate }); };
-    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' || pc.connectionState === 'closed') { this.pending.delete(tid); this.drop(tid); } };
+    pc.onconnectionstatechange = () => { if (pc.connectionState==='failed'||pc.connectionState==='closed') { this.pending.delete(tid); this.drop(tid); } };
     pc.createOffer().then(o => pc.setLocalDescription(o)).then(() => this.sig(tid, { type: 'offer', sdp: pc.localDescription })).catch(e => { console.error('Offer:', e); this.pending.delete(tid); });
   }
-
   onSig(m) {
-    const { from, fromName, signal } = m; if (from === this.id) return;
-    if (signal.type === 'offer') {
-      if (this.peers.has(from) || this.pending.has(from)) return;
-      const pc = new RTCPeerConnection(this.ice);
-      this.pending.set(from, { pc, name: fromName, role: 'resp' });
+    const { from, fromName, signal } = m; if (from===this.id) return;
+    if (signal.type==='offer') {
+      if (this.peers.has(from)||this.pending.has(from)) return;
+      const pc = new RTCPeerConnection(this.ice); this.pending.set(from, { pc, name: fromName, role: 'resp' });
       pc.ondatachannel = (e) => this.wireCh(e.channel, from, fromName);
       pc.onicecandidate = (e) => { if (e.candidate) this.sig(from, { type: 'candidate', candidate: e.candidate }); };
-      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' || pc.connectionState === 'closed') { this.pending.delete(from); this.drop(from); } };
-      pc.setRemoteDescription(signal.sdp).then(() => pc.createAnswer()).then(a => pc.setLocalDescription(a)).then(() => this.sig(from, { type: 'answer', sdp: pc.localDescription })).catch(e => { console.error('Answer:', e); this.pending.delete(from); });
-    } else if (signal.type === 'answer') {
-      const p = this.pending.get(from);
-      if (p?.pc && p.role === 'init' && p.pc.signalingState === 'have-local-offer') p.pc.setRemoteDescription(signal.sdp).catch(e => console.error('SRD:', e));
-    } else if (signal.type === 'candidate') {
-      const t = this.pending.get(from) || this.peers.get(from);
-      if (t?.pc) t.pc.addIceCandidate(signal.candidate).catch(e => console.error('ICE:', e));
-    }
+      pc.onconnectionstatechange = () => { if (pc.connectionState==='failed'||pc.connectionState==='closed') { this.pending.delete(from); this.drop(from); } };
+      pc.setRemoteDescription(signal.sdp).then(() => pc.createAnswer()).then(a => pc.setLocalDescription(a)).then(() => this.sig(from, { type: 'answer', sdp: pc.localDescription })).catch(e => { console.error('Ans:', e); this.pending.delete(from); });
+    } else if (signal.type==='answer') { const p = this.pending.get(from); if (p?.pc && p.role==='init' && p.pc.signalingState==='have-local-offer') p.pc.setRemoteDescription(signal.sdp).catch(e => console.error('SRD:', e)); }
+    else if (signal.type==='candidate') { const t = this.pending.get(from)||this.peers.get(from); if (t?.pc) t.pc.addIceCandidate(signal.candidate).catch(e => console.error('ICE:', e)); }
   }
 
+  // ═══ WIRE CHANNEL + CHAIN SYNC ═══
   async wireCh(ch, pid, pn) {
     ch.onopen = async () => {
       const p = this.pending.get(pid); const pc = p?.pc; this.pending.delete(pid);
       this.peers.set(pid, { pc, ch, info: { id: pid, name: pn }, seen: Date.now() });
-
-      // Send crypto handshake — keys, routing, genesis, moderation data
       const pubKeys = await this.crypto.exportPublic();
       this.genesis.peerCount = this.peers.size;
       this.sendTo(pid, {
-        type: 'handshake',
-        nodeId: this.id,
-        username: this.name,
-        keys: pubKeys,
-        nodes: this.snap(),
-        genesis: this.genesis.toPacket(),
-        bannedWords: this.mod.getBannedWordsPacket(),
-        admins: [...this.mod.admins],
-        mods: [...this.mod.mods],
-        ads: this.mod.getAdsPacket(),
-        mediaApprovals: [...this.mod.approvedMedia].slice(-200),
-        mediaRejections: [...this.mod.rejectedMedia].slice(-200),
-        slowMode: this._slowMode || {},
-        // Social data — own profile (without posts, posts go in social-sync)
-        profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar },
-        pins: this.pins,
-        broadcastChannels: [...this.broadcastChannels],
-        stories: this._getActiveStories(),
-        // File seeder info — which files we have cached
+        type: 'handshake', nodeId: this.id, username: this.name, keys: pubKeys, nodes: this.snap(),
+        genesis: this.genesis.toPacket(), admins: [...this.mod.admins], mods: [...this.mod.mods],
+        bannedWords: this.mod.getBannedWordsPacket(), ads: this.mod.getAdsPacket(),
+        mediaApprovals: [...this.mod.approvedMedia].slice(-200), mediaRejections: [...this.mod.rejectedMedia].slice(-200),
+        slowMode: this._slowMode || {}, broadcastChannels: [...this.broadcastChannels],
         fileHaves: [...this.ft.fileCache.keys()].slice(-100),
-        // Tombstones — deleted items that must not resurrect (v1.1.6)
-        tombstones: this._getTombstonePacket(),
+        syncLamport: this.actionLog.clock.time, latestEpoch: this.chain.latestEpoch, latestHash: this.chain.getLatestHash(), actionCount: this.actionLog.size,
       });
-
-      // IMPORTANT: Delay sync sending to allow peer's handshake (with tombstones) to arrive first
-      // This prevents resurrecting deleted items: we learn what was deleted before sending our data
-      setTimeout(() => {
-        // Send history for sync — filter out tombstoned messages
-        const history = this.store.getAll().filter(m => !this.chMgr.isDM(m.channel) && !this._isTombstoned(m.msgId));
-        if (history.length) this.sendTo(pid, { type: 'history-sync', messages: history });
-
-        // Send comprehensive social sync — ALL known posts, reactions, likes from all users
-        this._sendSocialSync(pid);
-      }, 500);
-
-      // If this peer is admin/mod, flush our pending queue to them
-      // (small delay so their handshake arrives first and they know they're admin)
-      setTimeout(() => this._flushToAdmin(pid), 300);
-
-      // Persist peer info
-      DB.savePeer({ id: pid, name: pn, lastSeen: Date.now() });
-      this.trust.onConnect(pid);
-
-      // Announce files we can seed (torrent-style distribution)
-      for (const [tid] of this.ft.fileCache) {
-        this.sendTo(pid, { type: 'file-have', transferId: tid, seederId: this.id });
-      }
-
-      console.log(`Connected to ${pn}`);
-      ui();
+      DB.savePeer({ id: pid, name: pn, lastSeen: Date.now() }); this.trust.onConnect(pid);
+      for (const [tid] of this.ft.fileCache) this.sendTo(pid, { type: 'file-have', transferId: tid, seederId: this.id });
+      console.log('Connected to ' + pn); ui();
     };
-    ch.onmessage = (e) => { try { this.onPeerMsg(pid, JSON.parse(e.data)); } catch (er) { console.error('Parse:', er); } };
+    ch.onmessage = (e) => { try { this.onPeerMsg(pid, JSON.parse(e.data)); } catch(er) { console.error('Parse:', er); } };
     ch.onclose = () => { this.drop(pid); ui(); };
   }
+  drop(id) { this.trust.onDisconnect(id); const p = this.peers.get(id); if (p) { try { p.ch?.close(); } catch(_) {} try { p.pc?.close(); } catch(_) {} } this.peers.delete(id); this.pending.delete(id); }
 
-  drop(id) {
-    this.trust.onDisconnect(id);
-    const p = this.peers.get(id);
-    if (p) { try { p.ch?.close(); } catch (_) { } try { p.pc?.close(); } catch (_) { } }
-    this.peers.delete(id); this.pending.delete(id);
-  }
-
-  // ── Peer messages ──
+  // ═══ PEER MESSAGE ROUTER ═══
   onPeerMsg(from, d) {
     const p = this.peers.get(from); if (p) p.seen = Date.now();
-    switch (d.type) {
-      case 'chat': this.onChat(d, from); break;
-      case 'dm': this.onDM(d, from); break;
+    switch(d.type) {
+      case 'action': this._onAction(d, from); break;
+      case 'chain-sync-request': this._onChainSyncReq(d, from); break;
+      case 'chain-sync': this._onChainSync(d, from); break;
       case 'handshake': this.onHandshake(d, from); break;
+      case 'typing': this.onTyping(d, from); break;
+      case 'msg-ack': this.onMsgAck(d); break;
+      case 'msg-read': this.onMsgRead(d); break;
+      case 'heartbeat': this.onHB(d, from); break;
       case 'dht-lookup': this.onDHTLook(d, from); break;
       case 'dht-lookup-reply': this.onDHTReply(d); break;
-      case 'heartbeat': this.onHB(d, from); break;
-      case 'history-sync': this.onHistSync(d); break;
-      case 'ban-vote': this.onBanVote(d, from); break;
-      case 'mod-report': this.onModReport(d, from); break;
-      case 'mod-action': this.onModAction(d, from); break;
-      case 'mod-media': this.onModMedia(d, from); break;
-      case 'mod-banwords': this.onBanWords(d, from); break;
       case 'file-meta': this.onFileMeta(d, from); break;
       case 'file-chunk': this.onFileChunk(d, from); break;
       case 'file-have': this._onFileHave(d, from); break;
       case 'file-request': this._onFileRequest(d, from); break;
+      case 'mod-report': this.onModReport(d, from); break;
+      case 'mod-action': this.onModAction(d, from); break;
+      case 'mod-media': this.onModMedia(d, from); break;
       case 'mod-roles': this.onModRoles(d); break;
       case 'mod-ads': this.onModAds(d, from); break;
-      case 'reaction': this.onReaction(d, from); break;
-      case 'delete-msg': this.onDeleteMsg(d, from); break;
-      case 'edit-msg': this.onEditMsg(d, from); break;
-      case 'slow-mode': if (d.channel && d.seconds !== undefined) { if (!this._slowMode) this._slowMode = {}; this._slowMode[d.channel] = d.seconds; DB.setKey('slowMode', this._slowMode); } break;
-      case 'poll-vote': this.onPollVote(d, from); break;
-      // Social features (v21)
-      case 'typing': this.onTyping(d, from); break;
-      case 'msg-ack': this.onMsgAck(d, from); break;
-      case 'msg-read': this.onMsgRead(d, from); break;
-      case 'story': this.onStory(d, from); break;
-      case 'profile-update': this.onProfileUpdate(d, from); break;
-      case 'pin': this.onPin(d, from); break;
-      case 'social-post': this.onSocialPost(d, from); break;
-      case 'social-post-like': this.onSocialPostLike(d, from); break;
-      case 'social-post-delete': this._onPostDelete(d, from); break;
-      case 'story-delete': this._onStoryDelete(d, from); break;
-      case 'social-sync': this.onSocialSync(d, from); break;
+      case 'mod-banwords': this.onBanWords(d, from); break;
+      case 'ban-vote': this.onBanVote(d, from); break;
+      case 'slow-mode': if (d.channel && d.seconds!==undefined) { if (!this._slowMode) this._slowMode = {}; this._slowMode[d.channel] = d.seconds; DB.setKey('slowMode', this._slowMode); } break;
       case 'signal-relay-request': this._onRelayRequest(d, from); break;
       case 'signal-relay': this._onRelaySignal(d, from); break;
     }
   }
 
-  // ── Handshake — receive keys + resolve network genesis conflicts ──
+  // ═══ ACTION LOG PROTOCOL ═══
+  _onAction(d, from) {
+    const a = d.action; if (!a?.id) return;
+    if (this.gossip.has(a.id)) return; this.gossip.mark(a.id);
+    if (this.blocked.has(a.senderId)) return;
+    const lt = this._lastMsgTime.get(a.senderId)||0;
+    if (Date.now()-lt < 300) return; this._lastMsgTime.set(a.senderId, Date.now());
+    if (!this.trust.shouldAccept(a.senderId)) return;
+    // DM decrypt
+    if (a.type==='msg' && a.data?.encrypted && a.data?.targetId===this.id) { this._decryptDM(a, from); return; }
+    if (this.actionLog.add(a)) {
+      this.trust.onMessageReceived(a.senderId);
+      if (from!==a.senderId) this.trust.onRelay(from);
+      if (a.data?.text) { const sc = this.mod.scanText(a.data.text); if (sc.flagged) this._autoReport({ sender: a.senderName, senderId: a.senderId, text: a.data.text, channel: a.channel, ts: a.ts }, sc.reason); }
+      if (a.channel) this.chMgr.joined.add(a.channel);
+      this._notifyUI(a);
+      if ((d.hops||0) < CFG.TTL) { const fwd = { type: 'action', action: a, hops: (d.hops||0)+1 }; const tg = this.gossip.pick([...this.peers.values()].map(p => p.info), [from, a.senderId]); for (const t of tg) this.sendTo(t.id, fwd); }
+      this.gCnt++; stats();
+    }
+  }
+  async _decryptDM(a, from) {
+    const secret = this.dmSecrets.get(a.senderId); if (!secret||!a.data.encrypted) return;
+    const text = await this.crypto.decrypt(a.data.encrypted.iv, a.data.encrypted.ct, secret);
+    const dec = { ...a, data: { ...a.data, text } };
+    if (this.actionLog.add(dec)) {
+      const ch = a.channel || this.chMgr.dmChannel(this.id, a.senderId); this.chMgr.joined.add(ch);
+      if (!this._dmNames) this._dmNames = new Map(); this._dmNames.set(a.senderId.slice(0,8), a.senderName); DB.setKey('dmNames', Object.fromEntries(this._dmNames));
+      this.sendTo(from, { type: 'msg-ack', msgId: a.id }); this._notifyUI(dec);
+    }
+  }
+  _notifyUI(a) {
+    const ch = a.channel || 'general';
+    if (a.type==='msg') {
+      if (ch===this.chMgr.current) { const isDM = a.data?.isDM; showMsg({ sender: a.senderName, senderId: a.senderId, text: a.data?.text||'', time: a.ts, route: isDM?'e2e':'gossip', hops: a.data?.hops||0, self: false, channel: ch, verified: true, msgId: a.id, replyTo: a.data?.replyTo, fileMeta: a.data?.fileMeta, dm: isDM }); }
+      else if (!this.mutedChannels.has(ch)) { const m = a.data?.text && (a.data.text.includes('@'+this.name)||a.data.text.includes('@'+this.crypto.shortId)); showToast(a.senderName, a.data?.text||'', m?'mention':a.data?.isDM?'dm':'chat', ch); }
+      refreshChannelList();
+    } else if (a.type==='post') { if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); }
+    else if (a.type==='delete'||a.type==='edit'||a.type==='reaction'||a.type==='pin') scheduleRender();
+    else if (a.type==='story'||a.type==='story-delete') ui();
+    else if (a.type==='post-delete'||a.type==='like') { if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); }
+    else if (a.type==='profile') ui();
+  }
+
+  // ═══ CHAIN SYNC ═══
+  _onChainSyncReq(d, from) {
+    const acts = this.actionLog.getSince(d.sinceLamport||0);
+    for (let i = 0; i < acts.length; i += 200) this.sendTo(from, { type: 'chain-sync', actions: acts.slice(i, i+200), total: acts.length });
+    console.log('Chain sync: sent ' + acts.length + ' to ' + from.slice(0,8));
+  }
+  _onChainSync(d, from) {
+    if (!Array.isArray(d.actions)) return;
+    const added = this.actionLog.merge(d.actions);
+    if (added > 0) { this.state.rebuild(); this._syncCompat(); scheduleRender(); refreshChannelList(); if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); console.log('Chain sync: +' + added + ' from ' + from.slice(0,8)); }
+  }
+
+  // ═══ HANDSHAKE ═══
   async onHandshake(d, from) {
-    if (d.keys) {
-      this.peerKeys.set(d.nodeId || from, d.keys);
-      try {
-        const secret = await this.crypto.deriveShared(d.keys.dh);
-        this.dmSecrets.set(d.nodeId || from, secret);
-      } catch (e) { console.error('ECDH derive error:', e); }
-    }
+    if (d.keys) { this.peerKeys.set(d.nodeId||from, d.keys); try { const s = await this.crypto.deriveShared(d.keys.dh); this.dmSecrets.set(d.nodeId||from, s); } catch(_) {} }
     if (d.nodes) for (const n of d.nodes) this.rt.add(n);
-
-    // ── GENESIS CONFLICT RESOLUTION ──
-    if (d.genesis && d.genesis.networkId) {
-      if (!this.genesis.networkId) {
-        // We have no network yet — adopt theirs
-        await this.genesis.adopt(d.genesis);
-        this._adoptNetworkData(d);
-        console.log(`Joined network (admin: ${d.genesis.adminName || d.genesis.adminId?.slice(0, 8)})`);
-      } else if (this.genesis.networkId !== d.genesis.networkId) {
-        // CONFLICT: two different networks meeting
-        const ourPeers = this.peers.size;
-        const theirPeers = d.genesis.peerCount || 0;
-        const decision = this.genesis.compare(d.genesis, ourPeers, theirPeers);
-
-        if (decision === 'adopt') {
-          // Their network wins — adopt their genesis and rules
-          await this.genesis.adopt(d.genesis);
-          this._adoptNetworkData(d);
-          console.log(`Network merged — adopting (admin: ${d.genesis.adminName || '?'})`);
-        } else {
-          // Our network wins — they will adopt ours during their handshake
-          console.log(`Genesis conflict: we win (our peers: ${ourPeers}, theirs: ${theirPeers})`);
-        }
-      } else {
-        // Same network — just merge moderation data normally
-        if (d.bannedWords) this.mod.mergeBannedWords(d.bannedWords);
-        if (Array.isArray(d.ads) && d.ads.length) this.mod.customAds = d.ads;
-      }
-    } else {
-      if (d.bannedWords) this.mod.mergeBannedWords(d.bannedWords);
-    }
-
-    this.mod.checkAdmin(this.id);
-    const peer = this.peers.get(from);
-    if (peer && d.username) peer.info.name = d.username;
-
-    // Merge media approval/rejection state (prevents stale "pending" on reconnect)
-    if (Array.isArray(d.mediaApprovals)) {
-      for (const mid of d.mediaApprovals) this.mod.approvedMedia.add(mid);
-      DB.setKey('mod:approved', [...this.mod.approvedMedia]);
-    }
-    if (Array.isArray(d.mediaRejections)) {
-      for (const mid of d.mediaRejections) this.mod.rejectedMedia.add(mid);
-      DB.setKey('mod:rejected', [...this.mod.rejectedMedia]);
-    }
-
-    // Merge slow mode settings
-    if (d.slowMode && typeof d.slowMode === 'object') {
-      if (!this._slowMode) this._slowMode = {};
-      for (const [ch, sec] of Object.entries(d.slowMode)) {
-        if (typeof sec === 'number') this._slowMode[ch] = sec;
-      }
-      DB.setKey('slowMode', this._slowMode);
-    }
-
-    // Merge social data (v1.1.6 — merge, don't overwrite)
-    const senderId = d.nodeId || from;
-    if (d.profile) {
-      const existing = this.peerProfiles.get(senderId) || {};
-      // Merge profile fields but preserve existing posts
-      this.peerProfiles.set(senderId, {
-        ...existing,
-        bio: d.profile.bio ?? existing.bio ?? '',
-        status: d.profile.status ?? existing.status ?? 'offline',
-        emoji: d.profile.emoji ?? existing.emoji ?? '',
-        avatar: d.profile.avatar ?? existing.avatar ?? '',
-        posts: existing.posts || [],  // Posts come via social-sync now
-        lastSeen: Date.now(),
-      });
-    }
-    if (d.pins && typeof d.pins === 'object') {
-      for (const [ch, pns] of Object.entries(d.pins)) {
-        if (Array.isArray(pns) && pns.length > 0) {
-          // Merge pins — union unique, keep max 3
-          const existing = this.pins[ch] || [];
-          const merged = [...new Set([...existing, ...pns])].slice(-3);
-          this.pins[ch] = merged;
-        }
-      }
-      DB.setKey('pins', this.pins);
-    }
-    if (Array.isArray(d.broadcastChannels)) {
-      for (const c of d.broadcastChannels) this.broadcastChannels.add(c);
-      DB.setKey('broadcastChannels', [...this.broadcastChannels]);
-    }
-    if (Array.isArray(d.stories)) {
-      for (const s of d.stories) {
-        if (s.senderId && s.ts && s.expiresAt > Date.now()) {
-          this.stories.set(s.senderId + '-' + s.ts, s);
-        }
-      }
-      this._saveStories();
-    }
-
-    // Register peer's file cache as seeders
-    if (Array.isArray(d.fileHaves)) {
-      for (const tid of d.fileHaves) {
-        this.ft.addSeeder(tid, senderId);
-      }
-    }
-
-    // Merge tombstones (v1.1.6) — learn about deletions we missed while offline
-    if (Array.isArray(d.tombstones)) {
-      this._mergeTombstones(d.tombstones);
-    }
-
-    // If this peer is admin/mod, flush our pending admin queue to them
-    if (this.mod.admins.has(senderId) || this.mod.mods.has(senderId)) {
-      this._flushToAdmin(from);
-    }
-
-    ui();
-  }
-
-  // Adopt network data when we lose genesis conflict or join existing network
-  _adoptNetworkData(d) {
-    // Admin list from winning network replaces ours
-    if (Array.isArray(d.admins)) {
-      this.mod.admins = new Set(d.admins);
-      DB.setKey('mod:admins', d.admins);
-    }
-    if (Array.isArray(d.mods)) {
-      this.mod.mods = new Set(d.mods);
-      DB.setKey('mod:mods', d.mods);
-    }
-    if (d.bannedWords) this.mod.mergeBannedWords(d.bannedWords);
-    if (Array.isArray(d.ads)) {
-      this.mod.customAds = d.ads;
-      DB.setKey('mod:ads', d.ads);
+    if (d.genesis?.networkId) {
+      if (!this.genesis.networkId) { await this.genesis.adopt(d.genesis); this._adoptNet(d); }
+      else if (this.genesis.networkId!==d.genesis.networkId) { if (this.genesis.compare(d.genesis, this.peers.size, d.genesis.peerCount||0)==='adopt') { await this.genesis.adopt(d.genesis); this._adoptNet(d); } }
+      else { if (d.bannedWords) this.mod.mergeBannedWords(d.bannedWords); if (Array.isArray(d.ads)&&d.ads.length) this.mod.customAds = d.ads; }
     }
     this.mod.checkAdmin(this.id);
-  }
-
-  // ── Chat (public channels) ──
-  async onChat(d, from) {
-    if (this.gossip.has(d.msgId)) return;
-    this.gossip.mark(d.msgId);
-    if (d.hops >= CFG.TTL) return;
-    // Tombstone check — reject messages that were already deleted (v1.1.6)
-    if (this._isTombstoned(d.msgId)) return;
-
-    // Block check — silently drop messages from blocked users
-    if (this.blocked.has(d.senderId)) return;
-
-    // Anti-flood: drop if same sender sent less than 500ms ago
-    const lastTime = this._lastMsgTime.get(d.senderId) || 0;
-    if (Date.now() - lastTime < 500) return;
-    this._lastMsgTime.set(d.senderId, Date.now());
-
-    // Trust gate
-    if (!this.trust.shouldAccept(d.senderId)) {
-      console.log(`Dropped msg from ${d.senderId.slice(0,8)} (rate limited or banned)`);
-      return;
-    }
-
-    // Verify signature if we have peer's key
-    let verified = false;
-    const peerKey = this.peerKeys.get(d.senderId);
-    if (peerKey && d.sig) {
-      const { sig, ...payload } = d;
-      verified = await this.crypto.verify(payload, sig, peerKey.sign);
-    }
-
-    // Trust scoring based on verification
-    if (verified) {
-      this.trust.onMessageReceived(d.senderId);
-      // Credit the relay peer too (if different from sender)
-      if (from !== d.senderId) this.trust.onRelay(from);
-    } else if (peerKey && d.sig) {
-      // Had key + sig but verification failed — suspicious
-      this.trust.onViolation(d.senderId);
-    }
-
-    this.clock.update(d.lamport || 0);
-    d._verified = verified;
-    this.store.add(d);
-
-    // AI pre-filter: scan incoming message for risk patterns
-    const scan = this.mod.scanText(d.text);
-    if (scan.flagged) {
-      // Auto-report silently to admin
-      const ctx = this.store.getChannel(d.channel || 'general');
-      const report = this.mod.createReport(d, ctx, this.id, { auto: true, reason: scan.reason });
-      this.mod.addReport(report);
-      // Broadcast report to admin peers
-      this._sendToAdmins({ type: 'mod-report', report });
-      console.log(`Auto-flagged message from ${d.sender}`);
-    }
-
-    const ch = d.channel || 'general';
-    this.chMgr.joined.add(ch);
-
-    if (ch === this.chMgr.current) {
-      const route = d.hops === 0 ? 'direct' : d.hops <= 2 ? 'gossip' : 'dht';
-      showMsg({ sender: d.sender, senderId: d.senderId, text: d.text, time: d.ts, route, hops: d.hops, self: false, channel: ch, verified, msgId: d.msgId, replyTo: d.replyTo, fileMeta: d.fileMeta });
-    } else {
-      // Toast for messages in other channels (unless muted)
-      if (!this.mutedChannels.has(ch)) {
-        const isMention = d.text && (d.text.includes(`@${this.name}`) || d.text.includes(`@${this.crypto.shortId}`));
-        showToast(d.sender, d.text, isMention ? 'mention' : 'chat', ch);
-      }
-    }
-
-    // Gossip forward
-    const fwd = { ...d }; delete fwd._verified; fwd.hops = d.hops + 1;
-    const tgts = this.gossip.pick([...this.peers.values()].map(p => p.info), [from, d.senderId]);
-    for (const t of tgts) this.sendTo(t.id, fwd);
-
-    this.gCnt++; refreshChannelList(); stats();
-  }
-
-  async sendChat(text, replyTo = null) {
-    const ch = this.chMgr.current;
-
-    // Slow mode check
-    const slowSec = this.getSlowMode(ch);
-    if (slowSec > 0 && !this.mod.isAdmin && !this.mod.isMod) {
-      const lastSent = this._lastSentTime?.[ch] || 0;
-      if (Date.now() - lastSent < slowSec * 1000) {
-        sys(`⏳ Slow mode: wait ${Math.ceil((slowSec * 1000 - (Date.now() - lastSent)) / 1000)}s`);
-        return;
-      }
-    }
-    if (!this._lastSentTime) this._lastSentTime = {};
-    this._lastSentTime[ch] = Date.now();
-
-    // If DM channel, send encrypted
-    if (this.chMgr.isDM(ch)) {
-      await this.sendDM(text, ch, replyTo);
-      return;
-    }
-
-    const lamport = this.clock.tick();
-    const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const d = { type: 'chat', msgId, sender: this.name, senderId: this.id, text, ts: Date.now(), hops: 0, channel: ch, lamport };
-    if (replyTo) d.replyTo = replyTo; // { msgId, sender, text }
-
-    // Scan own outgoing message
-    const scan = this.mod.scanText(text);
-    if (scan.flagged) {
-      const ctx = this.store.getChannel(ch);
-      const report = this.mod.createReport(d, ctx, this.id, { auto: true, reason: 'outgoing: ' + scan.reason });
-      this.mod.addReport(report);
-      this._sendToAdmins({ type: 'mod-report', report });
-    }
-
-    d.sig = await this.crypto.sign(d);
-    this.gossip.mark(msgId);
-    this.store.add({ ...d, _verified: true });
-    showMsg({ sender: this.name, senderId: this.id, text, time: d.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId, replyTo });
-
-    for (const [pid] of this.peers) this.sendTo(pid, d);
-    refreshChannelList(); stats();
-  }
-
-  // ── DM (encrypted private messages) ──
-  async sendDM(text, dmChannel, replyTo = null) {
-    // Find peer ID from DM channel name
-    const parts = dmChannel.replace('dm:', '').split('-');
-    let peerId = null;
-    for (const [id] of this.peers) {
-      if (parts.includes(id.slice(0, 8))) { peerId = id; break; }
-    }
-    // Also check dmSecrets
-    if (!peerId) {
-      for (const [id] of this.dmSecrets) {
-        if (parts.includes(id.slice(0, 8))) { peerId = id; break; }
-      }
-    }
-
-    const secret = peerId ? this.dmSecrets.get(peerId) : null;
-    if (!secret) { sys('⚠ No encryption key for this DM. Connect to peer first.'); return; }
-
-    // Scan outgoing DM
-    const scan = this.mod.scanText(text);
-    if (scan.flagged) {
-      const ctx = this.store.getChannel(dmChannel);
-      const report = this.mod.createReport(
-        { msgId: '', sender: this.name, senderId: this.id, text, channel: dmChannel, ts: Date.now() },
-        ctx, this.id, { auto: true, isDM: true, reason: 'outgoing DM: ' + scan.reason }
-      );
-      this.mod.addReport(report);
-      this._sendToAdmins({ type: 'mod-report', report });
-    }
-
-    const encrypted = await this.crypto.encrypt(text, secret);
-    const lamport = this.clock.tick();
-    const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const d = {
-      type: 'dm', msgId, sender: this.name, senderId: this.id,
-      ts: Date.now(), hops: 0, channel: dmChannel, lamport,
-      targetId: peerId, encrypted,
-    };
-    d.sig = await this.crypto.sign({ msgId: d.msgId, sender: d.sender, senderId: d.senderId, ts: d.ts, channel: d.channel, lamport: d.lamport, targetId: d.targetId });
-
-    this.gossip.mark(msgId);
-    // Store plaintext locally
-    this.store.add({ ...d, text, _verified: true });
-    showMsg({ sender: this.name, senderId: this.id, text, time: d.ts, route: 'e2e', hops: 0, self: true, channel: dmChannel, verified: true, dm: true });
-
-    // Send to target directly if connected, otherwise gossip
-    if (this.peers.has(peerId)) {
-      this.sendTo(peerId, d);
-    } else {
-      for (const [pid] of this.peers) this.sendTo(pid, d);
-    }
-    refreshChannelList(); stats();
-  }
-
-  async onDM(d, from) {
-    if (this.gossip.has(d.msgId)) return;
-    this.gossip.mark(d.msgId);
-    if (d.hops >= CFG.TTL) return;
-
-    // If this DM is for us, decrypt it
-    if (d.targetId === this.id) {
-      const secret = this.dmSecrets.get(d.senderId);
-      if (secret && d.encrypted) {
-        const text = await this.crypto.decrypt(d.encrypted.iv, d.encrypted.ct, secret);
-        this.clock.update(d.lamport || 0);
-
-        // AI scan DM content after decryption
-        const scan = this.mod.scanText(text);
-        if (scan.flagged) {
-          const ctx = this.store.getChannel(d.channel || '');
-          const report = this.mod.createReport(
-            { ...d, text }, ctx, this.id,
-            { auto: true, isDM: true, reason: scan.reason }
-          );
-          this.mod.addReport(report);
-          this._sendToAdmins({ type: 'mod-report', report });
-        }
-
-        const ch = d.channel || this.chMgr.dmChannel(this.id, d.senderId);
-        this.chMgr.joined.add(ch);
-        this.store.add({ ...d, text, _verified: true });
-
-        // Send delivery acknowledgment
-        this.sendAck(d.msgId, from);
-
-        // Save sender name for offline display
-        if (d.sender && d.senderId) {
-          if (!this._dmNames) this._dmNames = new Map();
-          this._dmNames.set(d.senderId.slice(0, 8), d.sender);
-        }
-
-        if (ch === this.chMgr.current) {
-          showMsg({ sender: d.sender, senderId: d.senderId, text, time: d.ts, route: 'e2e', hops: d.hops, self: false, channel: ch, verified: true, dm: true, msgId: d.msgId, replyTo: d.replyTo, fileMeta: d.fileMeta });
-        } else {
-          showToast(d.sender, text, 'dm', ch);
-        }
-        refreshChannelList(); stats();
-      }
-    } else {
-      // Not for us — forward if TTL allows (relay encrypted blob)
-      const fwd = { ...d, hops: d.hops + 1 };
-      if (this.peers.has(d.targetId)) {
-        this.sendTo(d.targetId, fwd);
-      } else {
-        const tgts = this.gossip.pick([...this.peers.values()].map(p => p.info), [from, d.senderId]);
-        for (const t of tgts) this.sendTo(t.id, fwd);
-      }
-    }
-  }
-
-  // Start a DM with a peer (from clicking their name)
-  async startDM(peerId) {
-    const peer = this.peers.get(peerId) || { info: { name: 'unknown' } };
-    const peerRt = this.rt.all.get(peerId);
-    const peerName = peer.info?.name || peerRt?.name || 'unknown';
-    const ch = this.chMgr.dmChannel(this.id, peerId);
-    this.chMgr.switchTo(ch);
-
-    // Save peer name for offline display
-    if (!this._dmNames) this._dmNames = new Map();
-    this._dmNames.set(peerId.slice(0, 8), peerName);
-    DB.setKey('dmNames', Object.fromEntries(this._dmNames));
-
-    if (!this.store.channels.has(ch)) this.store.channels.set(ch, []);
-    renderChannel();
-    refreshChannelList();
-    closeMobileDrawer();
-  }
-
-  // ── Report/Ban system ──
-  reportPeer(peerId) {
-    // Cast our own vote
-    this.trust.voteBan(peerId, this.id);
-    // Lower their trust locally
-    this.trust.onViolation(peerId);
-    // Broadcast vote to all peers
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'ban-vote', targetId: peerId, voterId: this.id });
-    }
-    // Check if ban threshold reached
-    const trustedCount = [...this.peers.values()].filter(p => this.trust.getScore(p.info.id) >= 40).length;
-    if (this.trust.checkBan(peerId, trustedCount)) {
-      this.trust.saveBans();
-      sys(`🚫 ${peerId.slice(0, 8)}… banned by community vote`);
-    }
+    const peer = this.peers.get(from); if (peer && d.username) peer.info.name = d.username;
+    const sid = d.nodeId||from;
+    if (Array.isArray(d.mediaApprovals)) { for (const m of d.mediaApprovals) this.mod.approvedMedia.add(m); DB.setKey('mod:approved', [...this.mod.approvedMedia]); }
+    if (Array.isArray(d.mediaRejections)) { for (const m of d.mediaRejections) this.mod.rejectedMedia.add(m); DB.setKey('mod:rejected', [...this.mod.rejectedMedia]); }
+    if (d.slowMode && typeof d.slowMode==='object') { if (!this._slowMode) this._slowMode = {}; for (const [ch,sec] of Object.entries(d.slowMode)) if (typeof sec==='number') this._slowMode[ch] = sec; DB.setKey('slowMode', this._slowMode); }
+    if (Array.isArray(d.broadcastChannels)) { for (const c of d.broadcastChannels) this.broadcastChannels.add(c); DB.setKey('broadcastChannels', [...this.broadcastChannels]); }
+    if (Array.isArray(d.fileHaves)) { for (const t of d.fileHaves) this.ft.addSeeder(t, sid); }
+    // Chain sync
+    const theirL = d.syncLamport||0, myL = this.actionLog.clock.time;
+    if (theirL > myL) this.sendTo(from, { type: 'chain-sync-request', sinceLamport: myL });
+    if (myL > theirL) { const m = this.actionLog.getSince(theirL); for (let i = 0; i < m.length; i += 200) this.sendTo(from, { type: 'chain-sync', actions: m.slice(i, i+200), total: m.length }); }
+    if (this.mod.admins.has(sid)||this.mod.mods.has(sid)) setTimeout(() => this._flushToAdmin(from), 300);
     ui();
   }
-
-  onBanVote(d, from) {
-    // Only accept votes from peers we somewhat trust
-    if (this.trust.getScore(from) < 30) return;
-    this.trust.voteBan(d.targetId, d.voterId);
-    // Check ban threshold
-    const trustedCount = [...this.peers.values()].filter(p => this.trust.getScore(p.info.id) >= 40).length;
-    if (this.trust.checkBan(d.targetId, trustedCount)) {
-      this.trust.saveBans();
-      console.log(`Peer ${d.targetId.slice(0, 8)} banned by community vote`);
-    }
-    // Forward vote to other peers (gossip)
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-  }
-
-  // ── Moderation: report a message ──
-  reportMessage(msg) {
-    const ch = msg.channel || 'general';
-    const ctx = this.store.getChannel(ch);
-    const isDM = this.chMgr.isDM(ch);
-    const report = this.mod.createReport(msg, ctx, this.id, { isDM, reason: 'User report' });
-
-    // If we're admin, add directly
-    if (this.mod.isAdmin) {
-      this.mod.addReport(report);
-      ui();
-      return;
-    }
-    // Otherwise send to admin peers
-    this._sendToAdmins({ type: 'mod-report', report });
-    sys('⚑ Report sent to admins');
-  }
-
-  // Admin requests older messages for a reported user
-  requestHistory(reportedUserId, channel) {
-    // Search local store for this user's messages in this channel
-    const allMsgs = this.store.getChannel(channel);
-    return allMsgs.filter(m => m.senderId === reportedUserId);
-  }
-
-  // Admin action on a report
-  adminAction(reportId, action) {
-    if (!this.mod.isAdmin) return;
-    const report = this.mod.reviewReport(reportId, action, this.id);
-    if (!report) return;
-    if (action === 'ban') {
-      // Ban the reported user
-      this.trust.banList.add(report.reportedUserId);
-      this.trust.saveBans();
-      // Broadcast ban
-      for (const [pid] of this.peers) {
-        this.sendTo(pid, { type: 'ban-vote', targetId: report.reportedUserId, voterId: this.id });
-      }
-      sys(`🚫 ${report.reportedUserName} banned by admin`);
-    }
-    // Broadcast admin decision to network
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'mod-action', reportId, action, adminId: this.id });
-    }
-    ui();
-  }
-
-  // Admin approves/rejects media
-  adminMediaAction(mediaId, approve) {
-    if (!this.mod.isAdmin && !this.mod.isMod) return;
-    if (approve) this.mod.approveMedia(mediaId);
-    else this.mod.rejectMedia(mediaId);
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'mod-media', mediaId, approved: approve });
-    }
-    renderChannel();
-    ui();
-  }
-
-  // Handle incoming moderation messages
-  onModReport(d, from) {
-    if (!this.mod.isAdmin && !this.mod.isMod) {
-      this._sendToAdmins(d);
-      return;
-    }
-    if (d.report) {
-      this.mod.addReport(d.report);
-      setAdminAlert(true);
-      showToast('⚠ Report', d.report.targetMsg?.text || 'New report', 'mention', null);
-    }
-    ui();
-  }
-
-  onModAction(d, from) {
-    if (d.action === 'ban' && d.reportId) {
-      // Find report and apply ban
-      const report = this.mod.reports.find(r => r.id === d.reportId);
-      if (report) {
-        this.trust.banList.add(report.reportedUserId);
-        this.trust.saveBans();
-      }
-    }
-    // Forward to other peers so everyone gets admin decisions
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-  }
-
-  onModMedia(d, from) {
-    if (d.approved) this.mod.approveMedia(d.mediaId);
-    else this.mod.rejectMedia(d.mediaId);
-    // Forward media decisions to other peers
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-    scheduleRender(); // Re-render to show/hide media
-  }
-
-  // Send to known admin peers — queues if no admin online
-  _sendToAdmins(data) {
-    // 1. Try direct send to online admin/mod
-    for (const [pid] of this.peers) {
-      if (this.mod.admins.has(pid) || this.mod.mods.has(pid)) {
-        this.sendTo(pid, data);
-        return; // Delivered!
-      }
-    }
-    // 2. No admin/mod online — queue for later delivery
-    this._queueForAdmin(data);
-    // 3. Also relay to one connected peer (they'll queue it too if they can't reach admin)
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, data);
-      return; // Relay to first available peer
-    }
-    // 4. Completely alone — data is persisted in queue, will flush on next connection
-  }
-
-  // Queue admin-targeted data with dedup + TTL + size limit
-  _queueForAdmin(data) {
-    // Generate a unique ID for dedup
-    const qId = data.report?.id || data.reportId || data.mediaId || `q-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
-    // Don't add duplicates
-    if (this.pendingAdminQueue.some(q => q.id === qId)) return;
-    this.pendingAdminQueue.push({
-      id: qId,
-      data: data,
-      ts: Date.now(),
-    });
-    this._pruneAdminQueue();
-    DB.setKey('pending:adminQueue', this.pendingAdminQueue);
-    console.log(`Queued for admin: ${data.type} (${this.pendingAdminQueue.length} pending)`);
-  }
-
-  // Remove expired (>24h) and excess items
-  _pruneAdminQueue() {
-    const cutoff = Date.now() - 24 * 3600 * 1000;
-    this.pendingAdminQueue = this.pendingAdminQueue
-      .filter(q => q.ts > cutoff)
-      .slice(-50); // max 50 items — does NOT count toward 100 msg limit
-  }
-
-  // Flush all pending items to a connected admin/mod
-  _flushToAdmin(pid) {
-    // Verify target is actually admin/mod
-    if (!this.mod.admins.has(pid) && !this.mod.mods.has(pid)) return;
-    if (!this.pendingAdminQueue.length) return;
-    // Verify peer is still connected
-    const p = this.peers.get(pid);
-    if (!p || p.ch?.readyState !== 'open') return;
-
-    this._pruneAdminQueue();
-    let flushed = 0;
-    for (const q of this.pendingAdminQueue) {
-      this.sendTo(pid, q.data);
-      flushed++;
-    }
-    if (flushed > 0) {
-      console.log(`Flushed ${flushed} pending item(s) to admin ${pid.slice(0, 8)}`);
-      this.pendingAdminQueue = [];
-      DB.setKey('pending:adminQueue', []);
-    }
-  }
-
-  // Admin: add/remove banned word and broadcast to all peers
-  adminAddBannedWord(word, combo) {
-    if (!this.mod.isAdmin) return;
-    this.mod.addBannedWord(word, combo, this.id);
-    this._broadcastBanWords();
-  }
-
-  adminRemoveBannedWord(index) {
-    if (!this.mod.isAdmin) return;
-    this.mod.removeBannedWord(index);
-    this._broadcastBanWords();
-  }
-
-  // Admin: manage moderators
-  adminAddMod(peerId) {
-    if (!this.mod.isAdmin) return;
-    this.mod.addMod(peerId);
-    this._broadcastRoles();
-  }
-
-  adminRemoveMod(peerId) {
-    if (!this.mod.isAdmin) return;
-    this.mod.removeMod(peerId);
-    this._broadcastRoles();
-  }
-
-  _broadcastRoles() {
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'mod-roles', admins: [...this.mod.admins], mods: [...this.mod.mods] });
-    }
-    // Update server cache with current genesis + admin info
-    this._sendToServer({ type: 'genesis-update', genesis: { ...this.genesis.toPacket(), admins: [...this.mod.admins] } });
-  }
-
-  onModRoles(d) {
+  _adoptNet(d) {
     if (Array.isArray(d.admins)) { this.mod.admins = new Set(d.admins); DB.setKey('mod:admins', d.admins); }
     if (Array.isArray(d.mods)) { this.mod.mods = new Set(d.mods); DB.setKey('mod:mods', d.mods); }
+    if (d.bannedWords) this.mod.mergeBannedWords(d.bannedWords);
+    if (Array.isArray(d.ads)) { this.mod.customAds = d.ads; DB.setKey('mod:ads', d.ads); }
     this.mod.checkAdmin(this.id);
-    ui();
   }
 
-  // Admin: manage ads
-  adminAddAd(text, link, adType, placement, scriptCode) {
-    if (!this.mod.isAdmin) return;
-    this.mod.addAd(text, link, this.id, adType, placement, scriptCode);
-    this._broadcastAds();
-  }
+  // ═══ EPHEMERAL ═══
+  sendTyping(ch) { if (!this._lastTypingSent||Date.now()-this._lastTypingSent>2000) { this._lastTypingSent = Date.now(); for (const [pid] of this.peers) this.sendTo(pid, { type: 'typing', channel: ch, senderId: this.id, senderName: this.name }); } }
+  onTyping(d, from) { if (!d.channel||!d.senderName) return; if (!this.typing.has(d.channel)) this.typing.set(d.channel, new Map()); this.typing.get(d.channel).set(d.senderId||from, { name: d.senderName, ts: Date.now() }); if (typeof updateTypingUI==='function') updateTypingUI(); }
+  getTypingUsers(ch) { const m = this.typing.get(ch); if (!m) return []; const now = Date.now(), a = []; for (const [pid, info] of m) { if (now-info.ts<3500&&pid!==this.id) a.push(info.name); else m.delete(pid); } return a; }
+  sendAck(msgId, from) { this.sendTo(from, { type: 'msg-ack', msgId }); }
+  sendReadReceipt(ch) { if (!this.chMgr.isDM(ch)) return; const msgs = this.state.getChannel(ch); for (const m of msgs) { if (m.senderId!==this.id&&!m._read) { m._read = true; for (const [pid] of this.peers) { if (pid===m.senderId||m.senderId?.startsWith(pid?.slice(0,8))) this.sendTo(pid, { type: 'msg-read', msgId: m.msgId }); } } } }
+  onMsgAck(d) { const r = this.readReceipts.get(d.msgId)||{}; r.delivered = true; this.readReceipts.set(d.msgId, r); scheduleRender(); }
+  onMsgRead(d) { const r = this.readReceipts.get(d.msgId)||{}; r.delivered = true; r.read = true; this.readReceipts.set(d.msgId, r); scheduleRender(); }
 
-  adminRemoveAd(index) {
-    if (!this.mod.isAdmin) return;
-    this.mod.removeAd(index);
-    this._broadcastAds();
-  }
+  // ═══ FILE TRANSFER ═══
+  onFileMeta(d, from) { if (!d.meta) return; if (d.approved) this.mod.approveMedia(d.meta.transferId); else { this.mod.registerMedia(d.meta.transferId, d.sender||'?', d.senderId||from, d.channel||'general', d.meta.thumb||''); if (this.mod.isAdmin||this.mod.isMod) { setAdminAlert(true); showToast('📸 Media', (d.sender||'Someone')+' sent media', 'mention', null); } } }
+  onFileChunk(d, from) { if (!d.transferId||d.index===undefined||!d.data) return; const r = this.ft.receiveChunk(d.transferId, d.index, d.data, d.meta); if (r.complete) { const f = this.ft.assembleFile(d.transferId); if (f) { window._fileUrls = window._fileUrls||{}; window._fileUrls[d.transferId] = { url: URL.createObjectURL(f.blob), meta: f.meta }; this.ft.addSeeder(d.transferId, this.id); for (const [pid] of this.peers) this.sendTo(pid, { type: 'file-have', transferId: d.transferId, seederId: this.id }); scheduleRender(); } } }
+  _onFileHave(d, from) { if (!d.transferId||!d.seederId) return; this.ft.addSeeder(d.transferId, d.seederId); for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } }
+  _onFileRequest(d, from) { if (!d.transferId) return; const f = this.ft.getChunks(d.transferId); if (!f) return; this.sendTo(from, { type: 'file-meta', meta: f.meta, sender: '', senderId: this.id, channel: '', msgId: '', approved: true }); for (let i = 0; i < f.chunks.length; i++) this.sendTo(from, { type: 'file-chunk', transferId: d.transferId, index: i, data: f.chunks[i], meta: f.meta }); }
+  requestFile(tid) { if (window._fileUrls?.[tid]) return; if (this.ft.hasFile(tid)) { const c = this.ft.fileCache.get(tid); if (c) { window._fileUrls = window._fileUrls||{}; window._fileUrls[tid] = { url: URL.createObjectURL(c.blob), meta: c.meta }; scheduleRender(); return; } } this.ft.loadFromCache(tid).then(r => { if (r) { window._fileUrls = window._fileUrls||{}; window._fileUrls[tid] = { url: URL.createObjectURL(r.blob), meta: r.meta }; scheduleRender(); } else { for (const [pid] of this.peers) this.sendTo(pid, { type: 'file-request', transferId: tid }); } }); }
+  _cleanFile(tid) { this.ft.fileCache.delete(tid); this.ft.outgoing.delete(tid); this.mod.approvedMedia.delete(tid); this.mod.rejectedMedia.delete(tid); if (window._fileUrls?.[tid]) { try { URL.revokeObjectURL(window._fileUrls[tid].url); } catch(_) {} delete window._fileUrls[tid]; } }
 
-  _broadcastAds() {
-    const ads = this.mod.getAdsPacket();
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'mod-ads', ads });
-    }
-  }
+  // ═══ MODERATION ═══
+  _autoReport(msg, reason) { const ctx = this.state.getChannel(msg.channel||'general'); const r = this.mod.createReport(msg, ctx, this.id, { auto: true, reason }); this.mod.addReport(r); this._sendToAdmins({ type: 'mod-report', report: r }); }
+  onModReport(d, from) { if (!this.mod.isAdmin&&!this.mod.isMod) { this._sendToAdmins(d); return; } if (d.report) { this.mod.addReport(d.report); setAdminAlert(true); showToast('⚠ Report', d.report.targetMsg?.text||'New report', 'mention', null); } ui(); }
+  onModAction(d, from) { if (d.action==='ban'&&d.reportId) { const r = this.mod.reports.find(x => x.id===d.reportId); if (r) { this.trust.banList.add(r.reportedUserId); this.trust.saveBans(); } } for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } }
+  onModMedia(d, from) { if (d.approved) this.mod.approveMedia(d.mediaId); else this.mod.rejectMedia(d.mediaId); for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } scheduleRender(); }
+  onModRoles(d) { if (Array.isArray(d.admins)) { this.mod.admins = new Set(d.admins); DB.setKey('mod:admins', d.admins); } if (Array.isArray(d.mods)) { this.mod.mods = new Set(d.mods); DB.setKey('mod:mods', d.mods); } this.mod.checkAdmin(this.id); ui(); }
+  onModAds(d, from) { if (Array.isArray(d.ads)) { this.mod.customAds = d.ads; DB.setKey('mod:ads', d.ads); for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } } }
+  onBanWords(d, from) { if (d.bannedWords&&this.mod.mergeBannedWords(d.bannedWords)) { for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } ui(); } }
+  onBanVote(d, from) { if (this.trust.getScore(from)<30) return; this.trust.voteBan(d.targetId, d.voterId); const tc = [...this.peers.values()].filter(p => this.trust.getScore(p.info.id)>=40).length; if (this.trust.checkBan(d.targetId, tc)) this.trust.saveBans(); for (const [pid] of this.peers) { if (pid!==from) this.sendTo(pid, d); } }
+  reportPeer(pid) { this.trust.voteBan(pid, this.id); this.trust.onViolation(pid); for (const [p] of this.peers) this.sendTo(p, { type: 'ban-vote', targetId: pid, voterId: this.id }); const tc = [...this.peers.values()].filter(p => this.trust.getScore(p.info.id)>=40).length; if (this.trust.checkBan(pid, tc)) { this.trust.saveBans(); sys('🚫 ' + pid.slice(0,8) + ' banned'); } ui(); }
+  reportMessage(msg) { const ctx = this.state.getChannel(msg.channel||'general'); const r = this.mod.createReport(msg, ctx, this.id, { isDM: this.chMgr.isDM(msg.channel), reason: 'User report' }); if (this.mod.isAdmin) { this.mod.addReport(r); ui(); return; } this._sendToAdmins({ type: 'mod-report', report: r }); sys('⚑ Report sent'); }
+  adminAction(rid, act) { if (!this.mod.isAdmin) return; const r = this.mod.reviewReport(rid, act, this.id); if (!r) return; if (act==='ban') { this.trust.banList.add(r.reportedUserId); this.trust.saveBans(); for (const [pid] of this.peers) this.sendTo(pid, { type: 'ban-vote', targetId: r.reportedUserId, voterId: this.id }); sys('🚫 ' + r.reportedUserName + ' banned'); } for (const [pid] of this.peers) this.sendTo(pid, { type: 'mod-action', reportId: rid, action: act, adminId: this.id }); ui(); }
+  adminMediaAction(mid, approve) { if (!this.mod.isAdmin&&!this.mod.isMod) return; if (approve) this.mod.approveMedia(mid); else this.mod.rejectMedia(mid); for (const [pid] of this.peers) this.sendTo(pid, { type: 'mod-media', mediaId: mid, approved: approve }); renderChannel(); ui(); }
+  adminAddBannedWord(w, c) { if (!this.mod.isAdmin) return; this.mod.addBannedWord(w, c, this.id); this._broadcastBW(); }
+  adminRemoveBannedWord(i) { if (!this.mod.isAdmin) return; this.mod.removeBannedWord(i); this._broadcastBW(); }
+  adminAddMod(pid) { if (!this.mod.isAdmin) return; this.mod.addMod(pid); this._broadcastRoles(); }
+  adminRemoveMod(pid) { if (!this.mod.isAdmin) return; this.mod.removeMod(pid); this._broadcastRoles(); }
+  adminAddAd(text, link, adType, placement, scriptCode) { if (!this.mod.isAdmin) return; this.mod.addAd(text, link, this.id, adType, placement, scriptCode); this._broadcastAds(); }
+  adminRemoveAd(i) { if (!this.mod.isAdmin) return; this.mod.removeAd(i); this._broadcastAds(); }
+  _broadcastRoles() { for (const [pid] of this.peers) this.sendTo(pid, { type: 'mod-roles', admins: [...this.mod.admins], mods: [...this.mod.mods] }); this._sendToServer({ type: 'genesis-update', genesis: { ...this.genesis.toPacket(), admins: [...this.mod.admins] } }); }
+  _broadcastAds() { for (const [pid] of this.peers) this.sendTo(pid, { type: 'mod-ads', ads: this.mod.getAdsPacket() }); }
+  _broadcastBW() { for (const [pid] of this.peers) this.sendTo(pid, { type: 'mod-banwords', bannedWords: this.mod.getBannedWordsPacket() }); }
+  _sendToAdmins(d) { for (const [pid] of this.peers) { if (this.mod.admins.has(pid)||this.mod.mods.has(pid)) { this.sendTo(pid, d); return; } } this._queueForAdmin(d); for (const [pid] of this.peers) { this.sendTo(pid, d); return; } }
+  _queueForAdmin(d) { const qId = d.report?.id||d.reportId||'q-'+Date.now(); if (this.pendingAdminQueue.some(q => q.id===qId)) return; this.pendingAdminQueue.push({ id: qId, data: d, ts: Date.now() }); this._pruneAdminQueue(); DB.setKey('pending:adminQueue', this.pendingAdminQueue); }
+  _pruneAdminQueue() { const c = Date.now()-24*3600000; this.pendingAdminQueue = this.pendingAdminQueue.filter(q => q.ts>c).slice(-50); }
+  _flushToAdmin(pid) { if (!this.mod.admins.has(pid)&&!this.mod.mods.has(pid)) return; if (!this.pendingAdminQueue.length) return; const p = this.peers.get(pid); if (!p||p.ch?.readyState!=='open') return; for (const q of this.pendingAdminQueue) this.sendTo(pid, q.data); this.pendingAdminQueue = []; DB.setKey('pending:adminQueue', []); }
 
-  onModAds(d, from) {
-    if (Array.isArray(d.ads)) {
-      this.mod.customAds = d.ads;
-      DB.setKey('mod:ads', d.ads);
-      // Forward to other peers (exclude sender to prevent loop)
-      for (const [pid] of this.peers) {
-        if (pid !== from) this.sendTo(pid, d);
-      }
-    }
-  }
+  // ═══ MISC ═══
+  async startDM(pid) { const peer = this.peers.get(pid)||{info:{name:'unknown'}}; const pn = peer.info?.name||this.rt.all.get(pid)?.name||'unknown'; const ch = this.chMgr.dmChannel(this.id, pid); this.chMgr.switchTo(ch); if (!this._dmNames) this._dmNames = new Map(); this._dmNames.set(pid.slice(0,8), pn); DB.setKey('dmNames', Object.fromEntries(this._dmNames)); if (!this.state.messages.has(ch)) this.state.messages.set(ch, []); renderChannel(); refreshChannelList(); closeMobileDrawer(); }
+  blockUser(uid) { this.blocked.add(uid); DB.setKey('blocked', [...this.blocked]); }
+  unblockUser(uid) { this.blocked.delete(uid); DB.setKey('blocked', [...this.blocked]); }
+  isBlocked(uid) { return this.blocked.has(uid); }
+  addBookmark(msgId) { const msg = this.state.getAll().find(m => m.msgId===msgId); if (!msg||this.bookmarks.some(b => b.msgId===msgId)) return; this.bookmarks.push({ msgId, text: msg.text, sender: msg.sender, channel: msg.channel, ts: msg.ts }); if (this.bookmarks.length>50) this.bookmarks.shift(); DB.setKey('bookmarks', this.bookmarks); }
+  removeBookmark(msgId) { this.bookmarks = this.bookmarks.filter(b => b.msgId!==msgId); DB.setKey('bookmarks', this.bookmarks); }
+  muteChannel(ch) { this.mutedChannels.add(ch); DB.setKey('mutedChannels', [...this.mutedChannels]); }
+  unmuteChannel(ch) { this.mutedChannels.delete(ch); DB.setKey('mutedChannels', [...this.mutedChannels]); }
+  isMuted(ch) { return this.mutedChannels.has(ch); }
+  setSlowMode(ch, sec) { if (!this.mod.isAdmin) return; if (!this._slowMode) this._slowMode = {}; this._slowMode[ch] = sec; DB.setKey('slowMode', this._slowMode); for (const [pid] of this.peers) this.sendTo(pid, { type: 'slow-mode', channel: ch, seconds: sec }); }
+  getSlowMode(ch) { return this._slowMode?.[ch]||0; }
+  setBroadcast(ch, on) { if (!this.mod.isAdmin) return; if (on) this.broadcastChannels.add(ch); else this.broadcastChannels.delete(ch); DB.setKey('broadcastChannels', [...this.broadcastChannels]); this._emit('msg', { text: '📢 ' + ch + ' is now ' + (on?'broadcast-only':'open to all'), hops: 0 }, { channel: ch }); }
+  isBroadcast(ch) { return this.broadcastChannels.has(ch); }
+  canWrite(ch) { if (!this.isBroadcast(ch)) return true; return this.mod.isAdmin||this.mod.isMod; }
+  getBadges(pid) { const b = []; if (this.mod.admins.has(pid)) b.push({ icon: '🛡️', label: 'Admin' }); if (this.mod.mods.has(pid)) b.push({ icon: '⚔️', label: 'Mod' }); const ha = Date.now()-3600000; if (this.state.getAll().filter(m => m.senderId===pid&&m.ts>ha).length>=10) b.push({ icon: '⚡', label: 'Active' }); const p = this.peers.get(pid); if (p&&Date.now()-(this.trust.firstSeen?.[pid]||p.seen)<3600000) b.push({ icon: '🆕', label: 'New' }); return b; }
+  getProfile(pid) { if (pid===this.id) return { ...this.profile, name: this.name, id: this.id, online: true, lastSeen: Date.now(), posts: this.state.getUserPosts(this.id) }; const p = this.peerProfiles.get(pid)||{}; const peer = this.peers.get(pid); return { bio: p.bio||'', status: p.status||'offline', emoji: p.emoji||'', avatar: p.avatar||'', posts: this.state.getUserPosts(pid), name: peer?.info?.name||p.name||pid.slice(0,8), id: pid, online: !!peer, lastSeen: peer?.seen||p.lastSeen||0 }; }
+  _getActiveStories() { return this.state.getActiveStories(); }
+  requestHistory(uid, ch) { return this.state.getChannel(ch).filter(m => m.senderId===uid); }
 
-  _broadcastBanWords() {
-    const packet = this.mod.getBannedWordsPacket();
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'mod-banwords', bannedWords: packet });
-    }
-  }
-
-  onBanWords(d, from) {
-    if (d.bannedWords && this.mod.mergeBannedWords(d.bannedWords)) {
-      console.log('Banned words list updated');
-      // Forward to other peers (exclude sender)
-      for (const [pid] of this.peers) {
-        if (pid !== from) this.sendTo(pid, d);
-      }
-      ui();
-    }
-  }
-
-  // ── FILE SHARING ──
-  async sendFile(file) {
-    const ch = this.chMgr.current;
-    const result = await this.ft.prepareFile(file);
-    if (result.error) { sys(`⚠ ${result.error}`); return; }
-
-    const { meta, chunks } = result;
-    const lamport = this.clock.tick();
-    const msgId = `${this.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Immediately make file available for own rendering — use original file directly
-    window._fileUrls = window._fileUrls || {};
-    window._fileUrls[meta.transferId] = { url: URL.createObjectURL(file), meta };
-
-    // All files are images now (accept=image/*) — always need approval
-    const needsApproval = true;
-    if (needsApproval) {
-      this.mod.registerMedia(meta.transferId, this.name, this.id, ch, meta.thumb);
-      if (this.mod.isAdmin || this.mod.isMod) {
-        this.mod.approveMedia(meta.transferId);
-        // Will broadcast approval with the file-meta
-      }
-    }
-
-    // Store as chat message
-    const d = {
-      type: 'chat', msgId, sender: this.name, senderId: this.id,
-      text: '',
-      ts: Date.now(), hops: 0, channel: ch, lamport,
-      fileMeta: meta,
-    };
-    d.sig = await this.crypto.sign(d);
-    this.gossip.mark(msgId);
-    this.store.add({ ...d, _verified: true });
-    showMsg({ sender: this.name, senderId: this.id, text: d.text, time: d.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId, fileMeta: meta });
-
-    // Send meta + chunks to all peers
-    const isApproved = this.mod.approvedMedia.has(meta.transferId);
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'file-meta', meta, sender: this.name, senderId: this.id, channel: ch, msgId, approved: isApproved });
-      for (let i = 0; i < chunks.length; i++) {
-        this.sendTo(pid, { type: 'file-chunk', transferId: meta.transferId, index: i, data: chunks[i], meta });
-      }
-    }
-
-    // Also send the chat message via gossip
-    for (const [pid] of this.peers) this.sendTo(pid, d);
-    refreshChannelList(); stats();
-  }
-
-  onFileMeta(d, from) {
-    if (!d.meta) return;
-    if (d.approved) {
-      this.mod.approveMedia(d.meta.transferId);
-    } else {
-      this.mod.registerMedia(d.meta.transferId, d.sender || 'unknown', d.senderId || from, d.channel || 'general', d.meta.thumb || '');
-      if (this.mod.isAdmin || this.mod.isMod) {
-        setAdminAlert(true);
-        showToast('📸 Media', `${d.sender || 'Someone'} sent media for review`, 'mention', null);
-      }
-    }
-  }
-
-  onFileChunk(d, from) {
-    if (!d.transferId || d.index === undefined || !d.data) return;
-    const result = this.ft.receiveChunk(d.transferId, d.index, d.data, d.meta);
-    if (result.complete) {
-      const file = this.ft.assembleFile(d.transferId);
-      if (file) {
-        const url = URL.createObjectURL(file.blob);
-        window._fileUrls = window._fileUrls || {};
-        window._fileUrls[d.transferId] = { url, meta: file.meta };
-        // We now have this file — announce to ALL peers that we can seed
-        this.ft.addSeeder(d.transferId, this.id);
-        for (const [pid] of this.peers) {
-          this.sendTo(pid, { type: 'file-have', transferId: d.transferId, seederId: this.id });
-        }
-        scheduleRender();
-      }
-    }
-  }
-
-  // Peer announces they have a file
-  _onFileHave(d, from) {
-    if (!d.transferId || !d.seederId) return;
-    this.ft.addSeeder(d.transferId, d.seederId);
-    // Forward to other peers so everyone knows who has what
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-  }
-
-  // Someone requests a file we have — serve it
-  _onFileRequest(d, from) {
-    if (!d.transferId) return;
-    const file = this.ft.getChunks(d.transferId);
-    if (!file) return; // we don't have it
-    console.log(`Serving file ${d.transferId.slice(0,8)} to ${from.slice(0,8)}`);
-    // Send meta + all chunks
-    this.sendTo(from, { type: 'file-meta', meta: file.meta, sender: d.originalSender || '', senderId: d.originalSenderId || '', channel: d.channel || '', msgId: d.msgId || '', approved: true });
-    for (let i = 0; i < file.chunks.length; i++) {
-      this.sendTo(from, { type: 'file-chunk', transferId: d.transferId, index: i, data: file.chunks[i], meta: file.meta });
-    }
-  }
-
-  // Request a file from the swarm (any peer who has it)
-  requestFile(transferId, originalSender, originalSenderId, channel, msgId) {
-    // First check if we already have it cached
-    if (window._fileUrls?.[transferId]) return; // already have it
-    if (this.ft.hasFile(transferId)) {
-      // We have it in cache but no URL yet
-      const cached = this.ft.fileCache.get(transferId);
-      if (cached) {
-        const url = URL.createObjectURL(cached.blob);
-        window._fileUrls = window._fileUrls || {};
-        window._fileUrls[transferId] = { url, meta: cached.meta };
-        scheduleRender();
-        return;
-      }
-    }
-
-    // Try to load from IndexedDB cache first
-    this.ft.loadFromCache(transferId).then(cached => {
-      if (cached) {
-        const url = URL.createObjectURL(cached.blob);
-        window._fileUrls = window._fileUrls || {};
-        window._fileUrls[transferId] = { url, meta: cached.meta };
-        scheduleRender();
-        return;
-      }
-
-      // Not cached — request from swarm
-      const seeders = this.ft.getSeeders(transferId);
-      const requestData = { type: 'file-request', transferId, originalSender, originalSenderId, channel, msgId };
-
-      if (seeders.size > 0) {
-        // Ask known seeders first
-        for (const sid of seeders) {
-          if (this.peers.has(sid)) {
-            this.sendTo(sid, requestData);
-            console.log(`Requesting file ${transferId.slice(0,8)} from seeder ${sid.slice(0,8)}`);
-            return;
-          }
-        }
-      }
-
-      // No known seeder online — broadcast request to all peers
-      for (const [pid] of this.peers) {
-        this.sendTo(pid, requestData);
-      }
-      console.log(`Requesting file ${transferId.slice(0,8)} from swarm (${this.peers.size} peers)`);
-    });
-  }
-
-  // ── History sync ──
-  onHistSync(d) {
-    if (!d.messages?.length) return;
-    // Filter out DMs and tombstoned messages
-    const pub = d.messages.filter(m => m.type !== 'dm' && !this._isTombstoned(m.msgId));
-    const added = this.store.merge(pub);
-    if (added > 0) {
-      for (const m of pub) { this.gossip.mark(m.msgId); this.clock.update(m.lamport || 0); this.chMgr.joined.add(m.channel || 'general'); }
-      console.log(`Synced ${added} message(s)`);
-      scheduleRender(); refreshChannelList();
-    }
-  }
-
-  // ── DHT ──
+  // ═══ DHT + HB ═══
   onDHTLook(d, from) { const c = this.rt.closest(d.target, CFG.K); this.sendTo(from, { type: 'dht-lookup-reply', lid: d.lid, target: d.target, nodes: c.map(n => ({ id: n.id, name: n.name })) }); }
   onDHTReply(d) { if (d.nodes) for (const n of d.nodes) this.rt.add(n); ui(); }
   doLookup(t) { const c = this.rt.closest(t, CFG.ALPHA); for (const n of c) if (this.peers.has(n.id)) this.sendTo(n.id, { type: 'dht-lookup', lid: crypto.randomUUID(), target: t }); }
+  onHB(d, from) { const p = this.peers.get(from); if (p) p.seen = Date.now(); if (d.nodes) for (const n of d.nodes) this.rt.add(n); if (d.trust) this.trust.mergeTrust(d.trust, from); }
+  startHB() { setInterval(() => { this.genesis.peerCount = this.peers.size; const s = this.snap().slice(0,15); const td = this.trust.getShareable(); for (const [pid] of this.peers) this.sendTo(pid, { type: 'heartbeat', nid: this.id, ts: Date.now(), nodes: s, trust: td }); for (const [pid, p] of this.peers) { if (Date.now()-p.seen>CFG.TIMEOUT) { this.rt.rm(pid); this.drop(pid); } } ui(); }, CFG.HB); }
+  startRefresh() { setInterval(() => { const r = [...crypto.getRandomValues(new Uint8Array(20))].map(b => b.toString(16).padStart(2,'0')).join(''); this.doLookup(r); }, CFG.REFRESH); }
+  snap() { const n = []; for (const b of this.rt.bkts) for (const x of b) n.push({ id: x.id, name: x.name }); return n.slice(0,50); }
+  sendTo(pid, d) { const p = this.peers.get(pid); if (p?.ch?.readyState==='open') try { p.ch.send(JSON.stringify(d)); } catch(_) {} }
 
-  onHB(d, from) {
-    const p = this.peers.get(from);
-    if (p) p.seen = Date.now();
-    if (d.nodes) for (const n of d.nodes) this.rt.add(n);
-    // Merge trust reports from peer
-    if (d.trust) this.trust.mergeTrust(d.trust, from);
-  }
-
-  startHB() {
-    setInterval(() => {
-      this.genesis.peerCount = this.peers.size;
-      const s = this.snap().slice(0, 15);
-      const trustData = this.trust.getShareable();
-      for (const [pid] of this.peers) this.sendTo(pid, { type: 'heartbeat', nid: this.id, ts: Date.now(), nodes: s, trust: trustData });
-      for (const [pid, p] of this.peers) {
-        if (Date.now() - p.seen > CFG.TIMEOUT) { console.log(`${p.info.name} timed out`); this.rt.rm(pid); this.drop(pid); }
-      }
-      ui();
-    }, CFG.HB);
-  }
-
-  startRefresh() {
-    setInterval(() => {
-      const r = [...crypto.getRandomValues(new Uint8Array(20))].map(b => b.toString(16).padStart(2, '0')).join('');
-      this.doLookup(r);
-    }, CFG.REFRESH);
-  }
-
-  snap() { const n = []; for (const b of this.rt.bkts) for (const x of b) n.push({ id: x.id, name: x.name }); return n.slice(0, 50); }
-  sendTo(pid, d) { const p = this.peers.get(pid); if (p?.ch?.readyState === 'open') try { p.ch.send(JSON.stringify(d)); } catch (e) { console.error('Send:', e); } }
-
-  // ═══════════════════════════════════════
-  // SOCIAL FEATURES (v21)
-  // ═══════════════════════════════════════
-
-  // ── Typing indicator ──
-  sendTyping(channel) {
-    if (!this._lastTypingSent || Date.now() - this._lastTypingSent > 2000) {
-      this._lastTypingSent = Date.now();
-      for (const [pid] of this.peers) {
-        this.sendTo(pid, { type: 'typing', channel, senderId: this.id, senderName: this.name });
-      }
-    }
-  }
-
-  onTyping(d, from) {
-    if (!d.channel || !d.senderName) return;
-    if (!this.typing.has(d.channel)) this.typing.set(d.channel, new Map());
-    this.typing.get(d.channel).set(d.senderId || from, { name: d.senderName, ts: Date.now() });
-    if (typeof updateTypingUI === 'function') updateTypingUI();
-  }
-
-  getTypingUsers(channel) {
-    const map = this.typing.get(channel);
-    if (!map) return [];
-    const now = Date.now();
-    const active = [];
-    for (const [pid, info] of map) {
-      if (now - info.ts < 3500 && pid !== this.id) active.push(info.name);
-      else map.delete(pid);
-    }
-    return active;
-  }
-
-  // ── Read receipts (DM only) ──
-  sendAck(msgId, from) {
-    this.sendTo(from, { type: 'msg-ack', msgId });
-  }
-
-  sendReadReceipt(channel) {
-    if (!this.chMgr.isDM(channel)) return;
-    const msgs = this.store.getChannel(channel);
-    for (const m of msgs) {
-      if (m.senderId !== this.id && !m._read) {
-        m._read = true;
-        // Find who sent this DM and send read receipt
-        for (const [pid] of this.peers) {
-          if (pid === m.senderId || m.senderId?.startsWith(pid?.slice(0, 8))) {
-            this.sendTo(pid, { type: 'msg-read', msgId: m.msgId });
-          }
-        }
-      }
-    }
-  }
-
-  onMsgAck(d, from) {
-    const r = this.readReceipts.get(d.msgId) || {};
-    r.delivered = true;
-    this.readReceipts.set(d.msgId, r);
-    scheduleRender();
-  }
-
-  onMsgRead(d, from) {
-    const r = this.readReceipts.get(d.msgId) || {};
-    r.delivered = true;
-    r.read = true;
-    this.readReceipts.set(d.msgId, r);
-    scheduleRender();
-  }
-
-  // ── Profile ──
-  updateProfile(data) {
-    if (data.bio !== undefined) this.profile.bio = data.bio.slice(0, 150);
-    if (data.status !== undefined) this.profile.status = data.status;
-    if (data.emoji !== undefined) this.profile.emoji = data.emoji;
-    if (data.avatar !== undefined) this.profile.avatar = data.avatar;
-    DB.setKey('profile', this.profile);
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'profile-update', senderId: this.id, senderName: this.name, profile: { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar } });
-    }
-  }
-
-  onProfileUpdate(d, from) {
-    if (d.profile && d.senderId) {
-      const existing = this.peerProfiles.get(d.senderId) || {};
-      this.peerProfiles.set(d.senderId, { ...existing, ...d.profile, lastSeen: Date.now() });
-      // Forward to other peers
-      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, d); }
-    }
-    ui();
-  }
-
-  getProfile(peerId) {
-    if (peerId === this.id) return { ...this.profile, name: this.name, id: this.id, online: true, lastSeen: Date.now() };
-    const p = this.peerProfiles.get(peerId) || {};
-    const peer = this.peers.get(peerId);
-    return { bio: p.bio || '', status: p.status || 'offline', emoji: p.emoji || '', avatar: p.avatar || '', posts: p.posts || [], name: peer?.info?.name || p.name || peerId.slice(0, 8), id: peerId, online: !!peer, lastSeen: peer?.seen || p.lastSeen || 0 };
-  }
-
-  // ── Social posts (profile wall) ──
-  sendSocialPost(text, imageDataUrl) {
-    if (!text?.trim() && !imageDataUrl) return;
-    const postId = `post-${this.id.slice(0,8)}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
-    const post = { id: postId, senderId: this.id, senderName: this.name, text: (text || '').trim().slice(0, 500), ts: Date.now(), likes: [] };
-    if (imageDataUrl) {
-      // Generate tiny thumbnail for gossip (~10KB), store full image in cache
-      const fileId = `plaza-${postId}`;
-      post.imageId = fileId;
-      post.thumb = imageDataUrl; // compressImage already made this small (400px, 70%)
-      // Cache full image so we can serve it to peers
-      try {
-        const binary = atob(imageDataUrl.split(',')[1]);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const blob = new Blob([bytes], { type: 'image/jpeg' });
-        const meta = { transferId: fileId, fileName: 'plaza-image.jpg', fileSize: bytes.length, fileType: 'image/jpeg', totalChunks: Math.ceil(bytes.length / 16384), thumb: '' };
-        this.ft.fileCache.set(fileId, { blob, meta });
-        this.ft._cacheToDB(fileId, bytes, meta);
-        // Prepare chunks for serving
-        const chunks = [];
-        for (let i = 0; i < meta.totalChunks; i++) {
-          const start = i * 16384;
-          const end = Math.min(start + 16384, bytes.length);
-          const slice = bytes.slice(start, end);
-          let bin = '';
-          for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
-          chunks.push(btoa(bin));
-        }
-        this.ft.outgoing.set(fileId, { meta, chunks });
-      } catch (_) {
-        // Fallback: keep full image in post (old behavior)
-        post.image = imageDataUrl;
-      }
-    }
-    this.profile.posts.push(post);
-    if (this.profile.posts.length > 200) this.profile.posts = this.profile.posts.slice(-200);
-    DB.setKey('profile', this.profile);
-    // Broadcast — only thumb in gossip, not full image
-    const gossipPost = { ...post };
-    delete gossipPost.image; // don't gossip full image
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'social-post', post: gossipPost, hops: 0 });
-      // Announce we can seed this image
-      if (post.imageId) this.sendTo(pid, { type: 'file-have', transferId: post.imageId, seederId: this.id });
-    }
-    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-  }
-
-  onSocialPost(d, from) {
-    if (!d.post?.id || !d.post.senderId) return;
-    // Tombstone check — reject posts that were deleted (v1.1.6)
-    if (this._isTombstoned(d.post.id)) return;
-    const p = this.peerProfiles.get(d.post.senderId) || { posts: [] };
-    if (!p.posts) p.posts = [];
-    if (p.posts.some(x => x.id === d.post.id)) return;
-    p.posts.push(d.post);
-    if (p.posts.length > 200) p.posts = p.posts.slice(-200);
-    p.name = d.post.senderName;
-    this.peerProfiles.set(d.post.senderId, p);
-    // Track seeder
-    if (d.post.imageId) this.ft.addSeeder(d.post.imageId, d.post.senderId);
-    if ((d.hops || 0) < 3) {
-      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, { ...d, hops: (d.hops || 0) + 1 }); }
-    }
-    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-  }
-
-  likeSocialPost(postId, postOwnerId) {
-    // Find the post
-    const posts = postOwnerId === this.id ? this.profile.posts : (this.peerProfiles.get(postOwnerId)?.posts || []);
-    const post = posts.find(p => p.id === postId);
-    if (!post) return;
-    const idx = post.likes.indexOf(this.id);
-    if (idx >= 0) post.likes.splice(idx, 1); else post.likes.push(this.id);
-    if (postOwnerId === this.id) DB.setKey('profile', this.profile);
-    // Broadcast like
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'social-post-like', postId, postOwnerId, likerId: this.id, toggle: idx < 0 });
-    }
-    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-  }
-
-  // Delete a social post (own or admin)
-  deleteSocialPost(postId, postOwnerId) {
-    this._addTombstone(postId, 'post');
-    if (postOwnerId === this.id) {
-      this.profile.posts = this.profile.posts.filter(p => p.id !== postId);
-      DB.setKey('profile', this.profile);
-    } else if (this.mod.isAdmin || this.mod.isMod) {
-      const prof = this.peerProfiles.get(postOwnerId);
-      if (prof?.posts) prof.posts = prof.posts.filter(p => p.id !== postId);
-    }
-    // Broadcast deletion
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'social-post-delete', postId, postOwnerId, deletedBy: this.id });
-    }
-  }
-
-  // Delete a story (own or admin)
-  deleteStory(storyKey) {
-    this._addTombstone(storyKey, 'story');
-    this.stories.delete(storyKey);
-    this._saveStories();
-    // Broadcast
-    for (const [pid] of this.peers) {
-      this.sendTo(pid, { type: 'story-delete', storyKey, deletedBy: this.id });
-    }
-  }
-
-  // ── Stories ──
-  sendStory(text, bgColor, imageDataUrl) {
-    if (!text?.trim() && !imageDataUrl) return;
-    const story = { senderId: this.id, senderName: this.name, senderEmoji: this.profile.emoji, text: (text || '').trim().slice(0, 280), bgColor: bgColor || '#22d3ee', ts: Date.now(), expiresAt: Date.now() + 24 * 3600 * 1000 };
-    if (imageDataUrl) story.image = imageDataUrl;
-    this.stories.set(this.id + '-' + story.ts, story);
-    this._saveStories();
-    for (const [pid] of this.peers) this.sendTo(pid, { type: 'story', story, hops: 0 });
-  }
-
-  onStory(d, from) {
-    if (!d.story?.senderId || !d.story.ts) return;
-    const key = d.story.senderId + '-' + d.story.ts;
-    if (this.stories.has(key)) return;
-    if (d.story.expiresAt <= Date.now()) return;
-    // Tombstone check (v1.1.6)
-    if (this._isTombstoned(key)) return;
-    this.stories.set(key, d.story);
-    this._saveStories();
-    if ((d.hops || 0) < 3) {
-      for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, { ...d, hops: (d.hops || 0) + 1 }); }
-    }
-    ui();
-  }
-
-  _getActiveStories() {
-    const now = Date.now();
-    const active = [];
-    let changed = false;
-    for (const [key, s] of this.stories) {
-      if (s.expiresAt > now && !this._isTombstoned(key)) active.push(s);
-      else { this.stories.delete(key); changed = true; }
-    }
-    if (changed) this._saveStories();
-    return active;
-  }
-
-  _saveStories() {
-    const arr = [];
-    for (const [, s] of this.stories) arr.push(s);
-    DB.setKey('stories', arr);
-  }
-
-  // ── Pinned messages ──
-  pinMessage(channel, msgId) {
-    if (!this.mod.isAdmin && !this.mod.isMod) return;
-    if (!this.pins[channel]) this.pins[channel] = [];
-    if (this.pins[channel].includes(msgId)) return;
-    this.pins[channel].push(msgId);
-    if (this.pins[channel].length > 3) this.pins[channel].shift();
-    DB.setKey('pins', this.pins);
-    for (const [pid] of this.peers) this.sendTo(pid, { type: 'pin', channel, msgId, action: 'pin' });
-  }
-
-  unpinMessage(channel, msgId) {
-    if (!this.mod.isAdmin && !this.mod.isMod) return;
-    if (this.pins[channel]) {
-      this.pins[channel] = this.pins[channel].filter(id => id !== msgId);
-      DB.setKey('pins', this.pins);
-    }
-    for (const [pid] of this.peers) this.sendTo(pid, { type: 'pin', channel, msgId, action: 'unpin' });
-  }
-
-  onPin(d, from) {
-    if (!d.channel || !d.msgId) return;
-    if (d.action === 'pin') {
-      if (!this.pins[d.channel]) this.pins[d.channel] = [];
-      if (!this.pins[d.channel].includes(d.msgId)) this.pins[d.channel].push(d.msgId);
-      if (this.pins[d.channel].length > 3) this.pins[d.channel].shift();
-    } else if (d.action === 'unpin') {
-      if (this.pins[d.channel]) this.pins[d.channel] = this.pins[d.channel].filter(id => id !== d.msgId);
-    }
-    DB.setKey('pins', this.pins);
-    for (const [pid] of this.peers) { if (pid !== from) this.sendTo(pid, d); }
-    renderChannel();
-  }
-
-  // ── Broadcast mode ──
-  setBroadcast(channel, enabled) {
-    if (!this.mod.isAdmin) return;
-    if (enabled) this.broadcastChannels.add(channel); else this.broadcastChannels.delete(channel);
-    DB.setKey('broadcastChannels', [...this.broadcastChannels]);
-    for (const [pid] of this.peers) this.sendTo(pid, { type: 'chat', msgId: `bc-${Date.now()}`, sender: this.name, senderId: this.id, text: `📢 ${channel} is now ${enabled ? 'broadcast-only' : 'open to all'}`, ts: Date.now(), hops: 0, channel, lamport: this.clock.tick() });
-  }
-
-  isBroadcast(channel) {
-    return this.broadcastChannels.has(channel);
-  }
-
-  canWrite(channel) {
-    if (!this.isBroadcast(channel)) return true;
-    return this.mod.isAdmin || this.mod.isMod;
-  }
-
-  // ── Badges ──
-  getBadges(peerId) {
-    const badges = [];
-    if (this.mod.admins.has(peerId)) badges.push({ icon: '🛡️', label: 'Admin' });
-    if (this.mod.mods.has(peerId)) badges.push({ icon: '⚔️', label: 'Mod' });
-    // OG: joined within 24h of genesis
-    if (this.genesis.createdAt) {
-      const peer = this.peers.get(peerId);
-      const peerJoin = peer?.seen || this.peerProfiles.get(peerId)?.lastSeen;
-      if (peerJoin && peerJoin - this.genesis.createdAt < 24 * 3600 * 1000) badges.push({ icon: '🏆', label: 'OG' });
-    }
-    // Active: 10+ msgs in last hour
-    const hourAgo = Date.now() - 3600 * 1000;
-    const recentMsgs = this.store.getAll().filter(m => m.senderId === peerId && m.ts > hourAgo);
-    if (recentMsgs.length >= 10) badges.push({ icon: '⚡', label: 'Active' });
-    // New: first seen < 1 hour ago
-    const peer = this.peers.get(peerId);
-    if (peer && Date.now() - (this.trust.firstSeen?.[peerId] || peer.seen) < 3600 * 1000) badges.push({ icon: '🆕', label: 'New' });
-    return badges;
-  }
-
-  // ═══ TOMBSTONE SYSTEM (v1.1.6) ═══
-  // Tracks deleted items so they don't resurrect when offline peers reconnect
-
-  // Add a tombstone (call on every delete)
-  _addTombstone(id, type) {
-    this.tombstones.set(id, { ts: Date.now(), type });
-    this._saveTombstones();
-  }
-
-  // Merge incoming tombstones from a peer
-  _mergeTombstones(incoming) {
-    if (!Array.isArray(incoming)) return;
-    const cutoff = Date.now() - 48 * 3600 * 1000;
-    let changed = false;
-    for (const t of incoming) {
-      if (!t.id || !t.ts) continue;
-      if (t.ts < cutoff) continue; // expired
-      if (!this.tombstones.has(t.id)) {
-        this.tombstones.set(t.id, { ts: t.ts, type: t.type });
-        changed = true;
-      }
-    }
-    if (changed) {
-      this._saveTombstones();
-      this._applyTombstones();
-    }
-  }
-
-  // Apply all tombstones — remove deleted items from local data + files + UI
-  _applyTombstones() {
-    let changed = false;
-    for (const [id, info] of this.tombstones) {
-      if (info.type === 'msg') {
-        // Clean up file cache if message had an image
-        const allMsgs = this.store.getAll();
-        const msg = allMsgs.find(m => m.msgId === id);
-        if (msg?.fileMeta?.transferId) {
-          const tid = msg.fileMeta.transferId;
-          this.ft.fileCache.delete(tid);
-          this.ft.outgoing.delete(tid);
-          if (window._fileUrls?.[tid]) {
-            try { URL.revokeObjectURL(window._fileUrls[tid].url); } catch (_) {}
-            delete window._fileUrls[tid];
-          }
-        }
-        if (this.store.deleteMsg(id)) changed = true;
-        this.reactions.delete(id);
-      } else if (info.type === 'post') {
-        // Delete from own posts
-        const before = this.profile.posts.length;
-        const deletedPost = this.profile.posts.find(p => p.id === id);
-        this.profile.posts = this.profile.posts.filter(p => p.id !== id);
-        if (this.profile.posts.length < before) changed = true;
-        // Clean up post image cache
-        if (deletedPost?.imageId) {
-          this.ft.fileCache.delete(deletedPost.imageId);
-          this.ft.outgoing.delete(deletedPost.imageId);
-          if (window._fileUrls?.[deletedPost.imageId]) {
-            try { URL.revokeObjectURL(window._fileUrls[deletedPost.imageId].url); } catch (_) {}
-            delete window._fileUrls[deletedPost.imageId];
-          }
-        }
-        // Delete from all peer profiles
-        for (const [, prof] of this.peerProfiles) {
-          if (prof.posts) {
-            const pb = prof.posts.length;
-            const peerPost = prof.posts.find(p => p.id === id);
-            prof.posts = prof.posts.filter(p => p.id !== id);
-            if (prof.posts.length < pb) {
-              changed = true;
-              // Clean peer post image cache too
-              if (peerPost?.imageId) {
-                this.ft.fileCache.delete(peerPost.imageId);
-                this.ft.outgoing.delete(peerPost.imageId);
-                if (window._fileUrls?.[peerPost.imageId]) {
-                  try { URL.revokeObjectURL(window._fileUrls[peerPost.imageId].url); } catch (_) {}
-                  delete window._fileUrls[peerPost.imageId];
-                }
-              }
-            }
-          }
-        }
-      } else if (info.type === 'story') {
-        if (this.stories.has(id)) {
-          this.stories.delete(id);
-          changed = true;
-        }
-      }
-    }
-    if (changed) {
-      DB.setKey('profile', this.profile);
-      this._saveStories();
-      // Refresh UI so deleted items disappear
-      if (typeof renderChannel === 'function') scheduleRender();
-      if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-      if (typeof refreshChannelList === 'function') refreshChannelList();
-      ui();
-      console.log(`Tombstones applied: ${this.tombstones.size} items enforced`);
-    }
-  }
-
-  // Prune expired tombstones (>48h) and save
-  _saveTombstones() {
-    const cutoff = Date.now() - 48 * 3600 * 1000;
-    const arr = [];
-    for (const [id, info] of this.tombstones) {
-      if (info.ts > cutoff) arr.push({ id, ts: info.ts, type: info.type });
-      else this.tombstones.delete(id);
-    }
-    DB.setKey('tombstones', arr);
-  }
-
-  // Get tombstones for sending to peers
-  _getTombstonePacket() {
-    const arr = [];
-    const cutoff = Date.now() - 48 * 3600 * 1000;
-    for (const [id, info] of this.tombstones) {
-      if (info.ts > cutoff) arr.push({ id, ts: info.ts, type: info.type });
-    }
-    return arr;
-  }
-
-  // Check if an item is tombstoned
-  _isTombstoned(id) {
-    return this.tombstones.has(id);
-  }
-
-
-  // ═══ SOCIAL SYNC (v1.1.6) ═══
-  // Sends ALL known social data (posts, reactions, likes) to a peer
-  // This ensures reconnecting peers get everything they missed
-
-  _sendSocialSync(pid) {
-    // Collect ALL posts from all known users (own + peers)
-    const allPosts = [];
-
-    // Own posts
-    for (const post of (this.profile.posts || [])) {
-      allPosts.push({ ...post, _ownerId: this.id });
-    }
-
-    // Peer posts
-    for (const [peerId, prof] of this.peerProfiles) {
-      for (const post of (prof.posts || [])) {
-        allPosts.push({ ...post, _ownerId: peerId });
-      }
-    }
-
-    // Deduplicate by post ID and filter out tombstoned posts
-    const uniquePosts = [];
-    const seenIds = new Set();
-    for (const p of allPosts) {
-      if (p.id && !seenIds.has(p.id) && !this._isTombstoned(p.id)) {
-        seenIds.add(p.id);
-        uniquePosts.push(p);
-      }
-    }
-
-    // Collect all reactions (skip tombstoned message reactions)
-    const reactions = {};
-    for (const [msgId, emojiMap] of this.reactions) {
-      if (!this._isTombstoned(msgId)) reactions[msgId] = emojiMap;
-    }
-
-    // Collect peer profiles (without posts — posts are sent separately)
-    const profiles = {};
-    for (const [peerId, prof] of this.peerProfiles) {
-      profiles[peerId] = {
-        bio: prof.bio || '',
-        status: prof.status || 'offline',
-        emoji: prof.emoji || '',
-        avatar: prof.avatar || '',
-        name: prof.name || '',
-        lastSeen: prof.lastSeen || 0,
-      };
-    }
-    // Include own profile
-    profiles[this.id] = {
-      bio: this.profile.bio || '',
-      status: this.profile.status || 'online',
-      emoji: this.profile.emoji || '',
-      avatar: this.profile.avatar || '',
-      name: this.name,
-      lastSeen: Date.now(),
-    };
-
-    this.sendTo(pid, {
-      type: 'social-sync',
-      posts: uniquePosts.slice(-500),
-      reactions,
-      profiles,
-    });
-  }
-
-  // Handle incoming social sync — merge everything by ID
-  onSocialSync(d, from) {
-    let changed = false;
-
-    // Merge posts — group by owner, dedup by post ID, skip tombstoned
-    if (Array.isArray(d.posts)) {
-      for (const post of d.posts) {
-        if (!post.id || !post.senderId) continue;
-        // Skip tombstoned posts — they were deleted
-        if (this._isTombstoned(post.id)) continue;
-        const ownerId = post._ownerId || post.senderId;
-
-        if (ownerId === this.id) {
-          // It's our own post — check if we have it
-          if (!(this.profile.posts || []).some(p => p.id === post.id)) {
-            // We don't have it — might have been deleted locally, skip
-            // (We are authority on our own posts)
-          }
-        } else {
-          // Peer post — merge into their profile
-          const prof = this.peerProfiles.get(ownerId) || { posts: [] };
-          if (!prof.posts) prof.posts = [];
-          if (!prof.posts.some(p => p.id === post.id)) {
-            // Clean the _ownerId field before storing
-            const cleanPost = { ...post };
-            delete cleanPost._ownerId;
-            prof.posts.push(cleanPost);
-            if (prof.posts.length > 200) prof.posts = prof.posts.slice(-200);
-            changed = true;
-          } else {
-            // Post exists — merge likes (union)
-            const existing = prof.posts.find(p => p.id === post.id);
-            if (existing && Array.isArray(post.likes)) {
-              const mergedLikes = [...new Set([...(existing.likes || []), ...post.likes])];
-              if (mergedLikes.length > (existing.likes || []).length) {
-                existing.likes = mergedLikes;
-                changed = true;
-              }
-            }
-          }
-          this.peerProfiles.set(ownerId, prof);
-        }
-
-        // Track seeder for post images
-        if (post.imageId && post.senderId) {
-          this.ft.addSeeder(post.imageId, post.senderId);
-        }
-      }
-    }
-
-    // Merge reactions (skip tombstoned messages)
-    if (d.reactions && typeof d.reactions === 'object') {
-      for (const [msgId, emojiMap] of Object.entries(d.reactions)) {
-        if (this._isTombstoned(msgId)) continue;
-        if (!this.reactions.has(msgId)) {
-          this.reactions.set(msgId, emojiMap);
-          changed = true;
-        } else {
-          const existing = this.reactions.get(msgId);
-          for (const [emoji, senders] of Object.entries(emojiMap)) {
-            if (!existing[emoji]) {
-              existing[emoji] = [...senders];
-              changed = true;
-            } else {
-              // Union of senders
-              for (const sid of senders) {
-                if (!existing[emoji].includes(sid)) {
-                  existing[emoji].push(sid);
-                  changed = true;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Merge peer profiles (metadata only — bio, status, etc.)
-    if (d.profiles && typeof d.profiles === 'object') {
-      for (const [peerId, prof] of Object.entries(d.profiles)) {
-        if (peerId === this.id) continue; // Don't overwrite own profile
-        const existing = this.peerProfiles.get(peerId) || {};
-        // Only update if incoming data is newer or we have no data
-        const existingLastSeen = existing.lastSeen || 0;
-        const incomingLastSeen = prof.lastSeen || 0;
-        if (incomingLastSeen >= existingLastSeen || !existing.bio) {
-          this.peerProfiles.set(peerId, {
-            ...existing,
-            bio: prof.bio || existing.bio || '',
-            status: prof.status || existing.status || 'offline',
-            emoji: prof.emoji || existing.emoji || '',
-            avatar: prof.avatar || existing.avatar || '',
-            name: prof.name || existing.name || '',
-            posts: existing.posts || [],  // Preserve existing posts
-            lastSeen: Math.max(existingLastSeen, incomingLastSeen),
-          });
-        }
-      }
-    }
-
-    if (changed) {
-      if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-      scheduleRender();
-    }
-    console.log(`Social sync from ${from.slice(0, 8)}: ${(d.posts || []).length} posts, ${Object.keys(d.reactions || {}).length} reactions`);
-  }
-
-  // Handle social post likes (was missing in v1.1.5!)
-  onSocialPostLike(d, from) {
-    if (!d.postId || !d.likerId) return;
-    // Find the post in own posts or peer posts
-    let post = null;
-    if (d.postOwnerId === this.id) {
-      post = this.profile.posts.find(p => p.id === d.postId);
-      if (post) {
-        const idx = post.likes.indexOf(d.likerId);
-        if (d.toggle && idx < 0) post.likes.push(d.likerId);
-        else if (!d.toggle && idx >= 0) post.likes.splice(idx, 1);
-        DB.setKey('profile', this.profile);
-      }
-    } else {
-      const prof = this.peerProfiles.get(d.postOwnerId);
-      if (prof?.posts) {
-        post = prof.posts.find(p => p.id === d.postId);
-        if (post) {
-          if (!post.likes) post.likes = [];
-          const idx = post.likes.indexOf(d.likerId);
-          if (d.toggle && idx < 0) post.likes.push(d.likerId);
-          else if (!d.toggle && idx >= 0) post.likes.splice(idx, 1);
-        }
-      }
-    }
-    // Forward to other peers
-    const fwd = { ...d, hops: (d.hops || 0) + 1 };
-    if ((fwd.hops || 0) < 3) {
-      for (const [pid] of this.peers) {
-        if (pid !== from) this.sendTo(pid, fwd);
-      }
-    }
-    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-  }
-
-  // ═══ DELETE HANDLERS ═══
-  _onPostDelete(d, from) {
-    if (!d.postId) return;
-    this._addTombstone(d.postId, 'post');
-    let found = false;
-    // Delete from own posts
-    const ownBefore = this.profile.posts.length;
-    this.profile.posts = this.profile.posts.filter(p => p.id !== d.postId);
-    if (this.profile.posts.length < ownBefore) { found = true; DB.setKey('profile', this.profile); }
-    // Delete from ALL peer profiles (search everywhere)
-    for (const [pid, prof] of this.peerProfiles) {
-      if (prof.posts) {
-        const before = prof.posts.length;
-        prof.posts = prof.posts.filter(p => p.id !== d.postId);
-        if (prof.posts.length < before) found = true;
-      }
-    }
-    // Gossip forward to other peers
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
-  }
-
-  _onStoryDelete(d, from) {
-    if (!d.storyKey) return;
-    this._addTombstone(d.storyKey, 'story');
-    this.stories.delete(d.storyKey);
-    this._saveStories();
-    // Gossip forward
-    for (const [pid] of this.peers) {
-      if (pid !== from) this.sendTo(pid, d);
-    }
-    ui();
-  }
-
-  // ═══ P2P SIGNALING RELAY ═══
-  // When bootstrap is down, peers relay signaling for each other
-
-  // Rate limit check for relay
-  _canRelay() {
-    if (this._relayCount >= 5) return false; // max 5 relay/sec
-    this._relayCount++;
-    if (!this._relayResetTimer) {
-      this._relayResetTimer = setTimeout(() => { this._relayCount = 0; this._relayResetTimer = null; }, 1000);
-    }
-    return true;
-  }
-
-  // Someone asks us to relay their signaling to a target peer
-  _onRelayRequest(d, from) {
-    if (!d.targetId || !d.fromId) return;
-    if (!this._canRelay()) return; // rate limit
-    if (this.peers.has(d.targetId)) {
-      this.sendTo(d.targetId, { type: 'signal-relay', signal: { type: 'relay-offer', fromId: d.fromId, fromName: d.fromName }, relayedBy: this.id });
-      console.log(`Relaying: ${(d.fromName || d.fromId).slice(0,8)} → ${d.targetId.slice(0,8)}`);
-    }
-  }
-
-  // Receive a relayed signal — start connection or forward SDP/ICE
-  _onRelaySignal(d, from) {
-    if (!d.signal) return;
-    const sig = d.signal;
-    if (sig.type === 'relay-offer' && sig.fromId) {
-      if (!this.peers.has(sig.fromId) && !this.pending.has(sig.fromId)) {
-        console.log(`Relay offer from ${(sig.fromName || sig.fromId).slice(0,8)} via ${from.slice(0,8)}`);
-        this.relayPeers.set(sig.fromId, from); // remember who relays for this target
-        this.startConn(sig.fromId, sig.fromName || 'peer');
-      }
-    } else if (sig.sdp || sig.candidate) {
-      // Relayed ICE/SDP
-      const target = sig.targetId || sig.from;
-      if (target) {
-        // Are we the relay? Forward to target
-        if (this.peers.has(target)) {
-          this.sendTo(target, { type: 'signal-relay', signal: sig });
-        } else {
-          // We're the destination — process the signal
-          this.onSig({ signal: sig, from: target, fromName: sig.fromName });
-        }
-      }
-    }
-  }
-
-  // sig() — send signaling via bootstrap or relay
-  sig(to, s) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s }));
-    } else {
-      // Bootstrap down — use relay
-      const relay = this.relayPeers.get(to);
-      if (relay && this.peers.has(relay)) {
-        this.sendTo(relay, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
-      } else {
-        // Try any connected peer as relay
-        for (const [pid] of this.peers) {
-          this.sendTo(pid, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } });
-          return;
-        }
-      }
-    }
-  }
+  // ═══ RELAY ═══
+  _canRelay() { if (this._relayCount>=5) return false; this._relayCount++; if (!this._relayResetTimer) { this._relayResetTimer = setTimeout(() => { this._relayCount = 0; this._relayResetTimer = null; }, 1000); } return true; }
+  _onRelayRequest(d, from) { if (!d.targetId||!d.fromId||!this._canRelay()) return; if (this.peers.has(d.targetId)) this.sendTo(d.targetId, { type: 'signal-relay', signal: { type: 'relay-offer', fromId: d.fromId, fromName: d.fromName }, relayedBy: this.id }); }
+  _onRelaySignal(d, from) { if (!d.signal) return; const sig = d.signal; if (sig.type==='relay-offer'&&sig.fromId) { if (!this.peers.has(sig.fromId)&&!this.pending.has(sig.fromId)) { this.relayPeers.set(sig.fromId, from); this.startConn(sig.fromId, sig.fromName||'peer'); } } else if (sig.sdp||sig.candidate) { const t = sig.targetId||sig.from; if (t) { if (this.peers.has(t)) this.sendTo(t, { type: 'signal-relay', signal: sig }); else this.onSig({ signal: sig, from: t, fromName: sig.fromName }); } } }
+  sig(to, s) { if (this.ws?.readyState===WebSocket.OPEN) { this.ws.send(JSON.stringify({ type: 'signal', to, from: this.id, fromName: this.name, signal: s })); } else { const relay = this.relayPeers.get(to); if (relay&&this.peers.has(relay)) this.sendTo(relay, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } }); else { for (const [pid] of this.peers) { this.sendTo(pid, { type: 'signal-relay', signal: { ...s, targetId: to, from: this.id, fromName: this.name } }); return; } } } }
 }

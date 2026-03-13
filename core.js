@@ -7,7 +7,12 @@ const BOOTSTRAP = 'wss://meshchat-bootstrap.onrender.com';
 const CFG = {
   K: 20, ALPHA: 3, MAX_PEERS: 20, FANOUT: 6, TTL: 10,
   MSG_CACHE: 2000, HISTORY: 100, HB: 15000, TIMEOUT: 45000, REFRESH: 60000,
-  DB_NAME: 'meshchat', DB_VER: 3,
+  DB_NAME: 'meshchat', DB_VER: 4,
+  // ActionLog / Block config
+  EPOCH_MS: 30000,      // 30 second epochs
+  EPOCH_DELAY: 15000,   // 15 second delay before block closes
+  MAX_LOG: 5000,        // max actions in memory
+  PRUNE_AGE: 48 * 3600 * 1000, // 48h prune
 };
 
 // ═══════════════════════════════════════
@@ -138,6 +143,18 @@ const DB = {
         if (!db.objectStoreNames.contains('channels')) db.createObjectStore('channels', { keyPath: 'name' });
         if (!db.objectStoreNames.contains('peers')) db.createObjectStore('peers', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('fileCache')) db.createObjectStore('fileCache', { keyPath: 'id' });
+        // v4: ActionLog stores
+        if (!db.objectStoreNames.contains('actions')) {
+          const as = db.createObjectStore('actions', { keyPath: 'id' });
+          as.createIndex('epoch', 'epoch', { unique: false });
+          as.createIndex('lamport', 'lamport', { unique: false });
+          as.createIndex('type', 'type', { unique: false });
+          as.createIndex('channel', 'channel', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('blocks')) {
+          const bs = db.createObjectStore('blocks', { keyPath: 'key' });
+          bs.createIndex('epoch', 'epoch', { unique: false });
+        }
       };
       req.onsuccess = (e) => { DB.db = e.target.result; resolve(); };
       req.onerror = (e) => { console.error('DB error:', e); resolve(); }; // Don't block on DB failure
@@ -259,7 +276,7 @@ const DB = {
   // Delete all data — full reset
   async clearAll() {
     if (!DB.db) return;
-    const stores = ['kv', 'messages', 'channels', 'peers'];
+    const stores = ['kv', 'messages', 'channels', 'peers', 'actions', 'blocks'];
     for (const name of stores) {
       try {
         const tx = DB.db.transaction(name, 'readwrite');
@@ -267,6 +284,106 @@ const DB = {
         await new Promise(r => { tx.oncomplete = r; tx.onerror = r; });
       } catch (_) {}
     }
+  },
+
+  // ── ActionLog DB methods ──
+  async saveAction(action) {
+    if (!DB.db) return;
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('actions', 'readwrite');
+        tx.objectStore('actions').put(action);
+        tx.oncomplete = () => r();
+        tx.onerror = () => r();
+      } catch (_) { r(); }
+    });
+  },
+
+  async saveActions(actions) {
+    if (!DB.db || !actions.length) return;
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('actions', 'readwrite');
+        const store = tx.objectStore('actions');
+        for (const a of actions) store.put(a);
+        tx.oncomplete = () => r();
+        tx.onerror = () => r();
+      } catch (_) { r(); }
+    });
+  },
+
+  async getActions(sinceEpoch = 0) {
+    if (!DB.db) return [];
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('actions', 'readonly');
+        const idx = tx.objectStore('actions').index('epoch');
+        const range = IDBKeyRange.lowerBound(sinceEpoch);
+        const results = [];
+        const req = idx.openCursor(range);
+        req.onsuccess = (e) => {
+          const cur = e.target.result;
+          if (cur) { results.push(cur.value); cur.continue(); }
+          else r(results);
+        };
+        req.onerror = () => r([]);
+      } catch (_) { r([]); }
+    });
+  },
+
+  async getAllActions() {
+    if (!DB.db) return [];
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('actions', 'readonly');
+        const req = tx.objectStore('actions').getAll();
+        req.onsuccess = () => r(req.result || []);
+        req.onerror = () => r([]);
+      } catch (_) { r([]); }
+    });
+  },
+
+  async deleteAction(id) {
+    if (!DB.db) return;
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('actions', 'readwrite');
+        tx.objectStore('actions').delete(id);
+        tx.oncomplete = () => r();
+        tx.onerror = () => r();
+      } catch (_) { r(); }
+    });
+  },
+
+  async saveBlock(block) {
+    if (!DB.db) return;
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('blocks', 'readwrite');
+        tx.objectStore('blocks').put(block);
+        tx.oncomplete = () => r();
+        tx.onerror = () => r();
+      } catch (_) { r(); }
+    });
+  },
+
+  async getBlocks(sinceEpoch = 0) {
+    if (!DB.db) return [];
+    return new Promise(r => {
+      try {
+        const tx = DB.db.transaction('blocks', 'readonly');
+        const idx = tx.objectStore('blocks').index('epoch');
+        const range = IDBKeyRange.lowerBound(sinceEpoch);
+        const results = [];
+        const req = idx.openCursor(range);
+        req.onsuccess = (e) => {
+          const cur = e.target.result;
+          if (cur) { results.push(cur.value); cur.continue(); }
+          else r(results);
+        };
+        req.onerror = () => r([]);
+      } catch (_) { r([]); }
+    });
   },
 
   // Remove corrupt DM channels (missing colon after dm)
@@ -1254,5 +1371,406 @@ class NetworkGenesis {
     }
     // 2. Tie: older genesis wins
     return this.genesisTime <= theirGenesis.genesisTime ? 'keep' : 'adopt';
+  }
+}
+
+// ═══════════════════════════════════════
+// 11. ACTION LOG — Unified event ledger
+// ═══════════════════════════════════════
+// Every mutation (msg, edit, delete, like, post, story, pin, etc.)
+// is an Action in a single ordered log. State is derived from the log.
+
+class ActionLog {
+  constructor() {
+    this.actions = new Map();  // id -> Action
+    this.orphans = new Map();  // id -> Action (waiting for dependency)
+    this.clock = new LamportClock();
+    this._listeners = [];
+  }
+
+  // Create a new action
+  create(type, data, opts = {}) {
+    const id = `a-${(opts.senderId || '').slice(0,8)}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+    return {
+      id, type,
+      channel: opts.channel || null,
+      targetId: opts.targetId || null,
+      senderId: opts.senderId || '',
+      senderName: opts.senderName || '',
+      data: data || {},
+      ts: Date.now(),
+      lamport: this.clock.tick(),
+      epoch: Math.floor(Date.now() / CFG.EPOCH_MS),
+      sig: null,
+    };
+  }
+
+  // Add action — returns true if new
+  add(action) {
+    if (!action?.id) return false;
+    if (this.actions.has(action.id)) return false;
+
+    // Dependency check
+    if (action.targetId && this._needsDep(action)) {
+      if (!this._hasTarget(action.targetId)) {
+        this.orphans.set(action.id, action);
+        return true;
+      }
+    }
+
+    // Skip if target already deleted (except delete actions themselves)
+    if (action.targetId && !this._isDeleteType(action.type)) {
+      if (this._isDeleted(action.targetId)) return false;
+    }
+
+    this.actions.set(action.id, action);
+    this.clock.update(action.lamport || 0);
+    DB.saveAction(action);
+    this._resolveOrphans(action.id);
+    this._notify(action);
+    return true;
+  }
+
+  // Merge from sync
+  merge(incoming) {
+    if (!Array.isArray(incoming)) return 0;
+    const sorted = [...incoming].sort((a,b) => (a.lamport-b.lamport)||(a.ts-b.ts)||(a.senderId||'').localeCompare(b.senderId||''));
+    let added = 0;
+    for (const a of sorted) if (this.add(a)) added++;
+    return added;
+  }
+
+  _isDeleteType(type) { return type === 'delete' || type === 'post-delete' || type === 'story-delete'; }
+
+  _needsDep(action) {
+    return new Set(['edit','delete','like','reaction','pin','unpin','poll-vote','post-delete','story-delete']).has(action.type);
+  }
+
+  _hasTarget(targetId) {
+    if (this.actions.has(targetId)) return true;
+    for (const [,a] of this.actions) {
+      if (a.id === targetId) return true;
+    }
+    return false;
+  }
+
+  _isDeleted(targetId) {
+    for (const [,a] of this.actions) {
+      if (this._isDeleteType(a.type) && a.targetId === targetId) return true;
+    }
+    return false;
+  }
+
+  _resolveOrphans(newId) {
+    const resolved = [];
+    for (const [oid, orphan] of this.orphans) {
+      if (orphan.targetId === newId || this._hasTarget(orphan.targetId)) resolved.push(oid);
+    }
+    for (const oid of resolved) {
+      const o = this.orphans.get(oid);
+      this.orphans.delete(oid);
+      this.actions.set(oid, o);
+      DB.saveAction(o);
+      this._notify(o);
+      this._resolveOrphans(oid);
+    }
+  }
+
+  getSorted() {
+    const arr = [...this.actions.values()];
+    arr.sort((a,b) => (a.lamport-b.lamport)||(a.ts-b.ts)||(a.senderId||'').localeCompare(b.senderId||''));
+    return arr;
+  }
+
+  getSince(sinceLamport) { return this.getSorted().filter(a => a.lamport > sinceLamport); }
+  getEpochRange(from, to) { return this.getSorted().filter(a => a.epoch >= from && a.epoch <= to); }
+
+  on(fn) { this._listeners.push(fn); }
+  _notify(action) { for (const fn of this._listeners) try { fn(action); } catch(_){} }
+
+  async loadFromDB() {
+    const all = await DB.getAllActions();
+    const cutoff = Date.now() - CFG.PRUNE_AGE;
+    for (const a of all) {
+      if (a.ts > cutoff) { this.actions.set(a.id, a); if (a.lamport > this.clock.time) this.clock.time = a.lamport; }
+    }
+    console.log(`ActionLog: ${this.actions.size} actions loaded`);
+  }
+
+  async prune() {
+    const cutoff = Date.now() - CFG.PRUNE_AGE;
+    let count = 0;
+    for (const [id,a] of this.actions) { if (a.ts < cutoff) { this.actions.delete(id); DB.deleteAction(id); count++; } }
+    if (count) console.log(`Pruned ${count} actions`);
+  }
+
+  get size() { return this.actions.size; }
+}
+
+// ═══════════════════════════════════════
+// 12. BLOCK CHAIN — Epoch-based sync
+// ═══════════════════════════════════════
+
+class BlockChain {
+  constructor(peerId) {
+    this.peerId = peerId;
+    this.blocks = new Map();
+    this.latestEpoch = 0;
+    this._timer = null;
+  }
+
+  static currentEpoch() { return Math.floor(Date.now() / CFG.EPOCH_MS); }
+
+  async closeBlock(epoch, actions, prevHash) {
+    const blockActions = actions.filter(a => a.epoch === epoch);
+    if (!blockActions.length) return null;
+    const payload = JSON.stringify(blockActions.map(a => a.id).sort());
+    const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode((prevHash||'0') + payload));
+    const hash = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2,'0')).join('');
+    const block = {
+      key: `${epoch}-${this.peerId}`, epoch, peerId: this.peerId,
+      seq: this.blocks.size, prevHash: prevHash || '0',
+      actionIds: blockActions.map(a => a.id), actionCount: blockActions.length,
+      hash, closedAt: Date.now(),
+    };
+    this.blocks.set(block.key, block);
+    if (epoch > this.latestEpoch) this.latestEpoch = epoch;
+    await DB.saveBlock(block);
+    return block;
+  }
+
+  getLatestHash() {
+    let latest = null;
+    for (const [,b] of this.blocks) { if (!latest || b.epoch > latest.epoch) latest = b; }
+    return latest?.hash || '0';
+  }
+
+  getBlocksSince(sinceEpoch) {
+    const r = [];
+    for (const [,b] of this.blocks) if (b.epoch > sinceEpoch) r.push(b);
+    r.sort((a,b) => a.epoch - b.epoch);
+    return r;
+  }
+
+  async loadFromDB() {
+    const all = await DB.getBlocks(0);
+    for (const b of all) { this.blocks.set(b.key, b); if (b.epoch > this.latestEpoch) this.latestEpoch = b.epoch; }
+    console.log(`BlockChain: ${this.blocks.size} blocks, epoch ${this.latestEpoch}`);
+  }
+
+  startClosing(actionLog) {
+    this._timer = setInterval(async () => {
+      const closable = Math.floor((Date.now() - CFG.EPOCH_DELAY) / CFG.EPOCH_MS);
+      for (let e = this.latestEpoch + 1; e <= closable; e++) {
+        const acts = actionLog.getEpochRange(e, e);
+        if (acts.length) await this.closeBlock(e, acts, this.getLatestHash());
+      }
+      if (closable > this.latestEpoch) this.latestEpoch = closable;
+    }, CFG.EPOCH_DELAY);
+  }
+
+  stop() { if (this._timer) clearInterval(this._timer); }
+}
+
+// ═══════════════════════════════════════
+// 13. STATE BUILDER — Derives state from ActionLog
+// ═══════════════════════════════════════
+
+class StateBuilder {
+  constructor(actionLog) {
+    this.log = actionLog;
+    this.messages = new Map();    // channel -> [msg objects]
+    this.posts = [];
+    this.stories = new Map();
+    this.reactions = new Map();
+    this.pins = {};
+    this.profiles = new Map();
+    this.polls = new Map();
+    this._lastLamport = 0;
+  }
+
+  rebuild() {
+    this.messages.clear(); this.posts = []; this.stories.clear();
+    this.reactions.clear(); this.pins = {}; this.profiles.clear(); this.polls.clear();
+    for (const a of this.log.getSorted()) this._apply(a);
+    this._lastLamport = this.log.clock.time;
+  }
+
+  applyIncremental(action) { this._apply(action); }
+
+  _apply(a) {
+    switch(a.type) {
+      case 'msg': {
+        const ch = a.channel || 'general';
+        if (!this.messages.has(ch)) this.messages.set(ch, []);
+        const arr = this.messages.get(ch);
+        if (!arr.some(m => m.msgId === a.id)) {
+          arr.push({
+            msgId: a.id, sender: a.senderName, senderId: a.senderId,
+            text: a.data.text||'', ts: a.ts, lamport: a.lamport,
+            channel: ch, hops: a.data.hops||0, type: a.data.isDM ? 'dm' : 'chat',
+            _verified: a.data.verified ?? true, sig: a.sig,
+            replyTo: a.data.replyTo||null, fileMeta: a.data.fileMeta||null,
+            poll: a.data.poll||null, encrypted: a.data.encrypted||null,
+            targetId: a.data.targetId||null,
+          });
+          arr.sort((x,y) => (x.lamport-y.lamport)||(x.ts-y.ts));
+          if (arr.length > CFG.HISTORY) arr.splice(0, arr.length - CFG.HISTORY);
+        }
+        if (a.data.poll) this.polls.set(a.id, a.data.poll);
+        break;
+      }
+      case 'edit': {
+        if (!a.targetId) break;
+        for (const [,arr] of this.messages) {
+          const msg = arr.find(m => m.msgId === a.targetId);
+          if (msg) { msg.text = a.data.newText||msg.text; msg._edited = true; break; }
+        }
+        break;
+      }
+      case 'delete': {
+        if (!a.targetId) break;
+        for (const [,arr] of this.messages) {
+          const idx = arr.findIndex(m => m.msgId === a.targetId);
+          if (idx >= 0) { arr.splice(idx, 1); break; }
+        }
+        this.reactions.delete(a.targetId);
+        break;
+      }
+      case 'post': {
+        if (!this.posts.some(p => p.id === a.id)) {
+          this.posts.push({
+            id: a.id, senderId: a.senderId, senderName: a.senderName,
+            text: a.data.text||'', ts: a.ts, likes: a.data.likes||[],
+            thumb: a.data.thumb||null, imageId: a.data.imageId||null, image: a.data.image||null,
+          });
+          this.posts.sort((x,y) => y.ts - x.ts);
+          if (this.posts.length > 500) this.posts = this.posts.slice(0,500);
+        }
+        break;
+      }
+      case 'post-delete': {
+        if (a.targetId) this.posts = this.posts.filter(p => p.id !== a.targetId);
+        break;
+      }
+      case 'like': {
+        if (!a.targetId) break;
+        const post = this.posts.find(p => p.id === a.targetId);
+        if (post) {
+          if (!post.likes) post.likes = [];
+          const idx = post.likes.indexOf(a.senderId);
+          if (a.data.toggle && idx < 0) post.likes.push(a.senderId);
+          else if (!a.data.toggle && idx >= 0) post.likes.splice(idx, 1);
+        }
+        break;
+      }
+      case 'reaction': {
+        if (!a.targetId || !a.data.emoji) break;
+        if (!this.reactions.has(a.targetId)) this.reactions.set(a.targetId, {});
+        const rm = this.reactions.get(a.targetId);
+        if (!rm[a.data.emoji]) rm[a.data.emoji] = [];
+        const ri = rm[a.data.emoji].indexOf(a.senderId);
+        if (a.data.toggle && ri < 0) rm[a.data.emoji].push(a.senderId);
+        else if (!a.data.toggle && ri >= 0) rm[a.data.emoji].splice(ri, 1);
+        if (rm[a.data.emoji].length === 0) delete rm[a.data.emoji];
+        break;
+      }
+      case 'story': {
+        const key = a.data.storyKey || (a.senderId+'-'+a.ts);
+        if (a.data.expiresAt && a.data.expiresAt > Date.now()) {
+          this.stories.set(key, {
+            senderId: a.senderId, senderName: a.senderName,
+            senderEmoji: a.data.senderEmoji||'', text: a.data.text||'',
+            bgColor: a.data.bgColor||'#22d3ee', image: a.data.image||null,
+            ts: a.ts, expiresAt: a.data.expiresAt,
+          });
+        }
+        break;
+      }
+      case 'story-delete': { if (a.targetId) this.stories.delete(a.targetId); break; }
+      case 'pin': {
+        if (!a.channel || !a.targetId) break;
+        if (!this.pins[a.channel]) this.pins[a.channel] = [];
+        if (a.data.action === 'pin') {
+          if (!this.pins[a.channel].includes(a.targetId)) this.pins[a.channel].push(a.targetId);
+          if (this.pins[a.channel].length > 3) this.pins[a.channel].shift();
+        } else if (a.data.action === 'unpin') {
+          this.pins[a.channel] = this.pins[a.channel].filter(id => id !== a.targetId);
+        }
+        break;
+      }
+      case 'profile': {
+        const ex = this.profiles.get(a.senderId) || {};
+        this.profiles.set(a.senderId, {
+          ...ex,
+          ...(a.data.bio !== undefined ? {bio:a.data.bio} : {}),
+          ...(a.data.status !== undefined ? {status:a.data.status} : {}),
+          ...(a.data.emoji !== undefined ? {emoji:a.data.emoji} : {}),
+          ...(a.data.avatar !== undefined ? {avatar:a.data.avatar} : {}),
+          name: a.senderName || ex.name || '', lastSeen: a.ts,
+        });
+        break;
+      }
+      case 'poll-vote': {
+        if (!a.targetId) break;
+        const poll = this.polls.get(a.targetId);
+        if (poll) {
+          for (const opt of poll.options) opt.votes = (opt.votes||[]).filter(v => v !== a.senderId);
+          if (poll.options[a.data.optIdx]) {
+            if (!poll.options[a.data.optIdx].votes) poll.options[a.data.optIdx].votes = [];
+            poll.options[a.data.optIdx].votes.push(a.senderId);
+          }
+          for (const [,arr] of this.messages) {
+            const msg = arr.find(m => m.msgId === a.targetId);
+            if (msg) { msg.poll = poll; break; }
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // ── Compatibility API — old N.store interface ──
+  getChannel(ch) { return this.messages.get(ch) || []; }
+  getAllChannels() {
+    const r = [];
+    for (const [name,msgs] of this.messages) r.push({name, count:msgs.length});
+    r.sort((a,b) => b.count - a.count);
+    return r;
+  }
+  getAll() { const a = []; for (const m of this.messages.values()) a.push(...m); return a; }
+  getUserPosts(sid) { return this.posts.filter(p => p.senderId === sid); }
+  getActiveStories() {
+    const now = Date.now(), a = [];
+    for (const [k,s] of this.stories) { if (s.expiresAt > now) a.push({...s, key:k}); else this.stories.delete(k); }
+    return a;
+  }
+  getProfile(pid) { return this.profiles.get(pid) || {bio:'',status:'offline',emoji:'',avatar:'',name:''}; }
+  // Compat: deleteMsg for direct calls
+  deleteMsg(msgId) {
+    for (const [,arr] of this.messages) {
+      const idx = arr.findIndex(m => m.msgId === msgId);
+      if (idx >= 0) { arr.splice(idx,1); return true; }
+    }
+    return false;
+  }
+  // Compat: N.store.channels (Map access)
+  get channels() { return this.messages; }
+  // Compat: N.store.add (direct message add — used by topic set in ui.js)
+  add(msg) {
+    const ch = msg.channel || 'general';
+    if (!this.messages.has(ch)) this.messages.set(ch, []);
+    const arr = this.messages.get(ch);
+    if (arr.some(m => m.msgId === msg.msgId)) return false;
+    arr.push(msg);
+    arr.sort((a,b) => (a.lamport-b.lamport)||(a.ts-b.ts));
+    if (arr.length > CFG.HISTORY) arr.splice(0, arr.length - CFG.HISTORY);
+    return true;
+  }
+  // Compat: merge for old-style history sync
+  merge(incoming) {
+    let added = 0;
+    for (const m of incoming) { if (this.add(m)) added++; }
+    return added;
   }
 }
