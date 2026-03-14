@@ -1795,3 +1795,215 @@ class StateBuilder {
     return added;
   }
 }
+
+// ═══════════════════════════════════════
+// 10. CRYPTO PRICE ENGINE — P2P Cached
+// ═══════════════════════════════════════
+const CRYPTO_CFG = {
+  CACHE_TTL: 60000,        // 1 minute cache
+  COINGECKO_BASE: 'https://api.coingecko.com/api/v3',
+  FETCH_TIMEOUT: 8000,     // 8s timeout
+  MAX_PENDING: 5,          // max concurrent fetches
+};
+
+// Ticker → CoinGecko ID mapping (top coins)
+const TICKER_MAP = {
+  'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'BNB': 'binancecoin',
+  'XRP': 'ripple', 'ADA': 'cardano', 'DOGE': 'dogecoin', 'DOT': 'polkadot',
+  'AVAX': 'avalanche-2', 'MATIC': 'matic-network', 'POL': 'matic-network',
+  'LINK': 'chainlink', 'SHIB': 'shiba-inu', 'LTC': 'litecoin', 'UNI': 'uniswap',
+  'ATOM': 'cosmos', 'XLM': 'stellar', 'ALGO': 'algorand', 'FIL': 'filecoin',
+  'NEAR': 'near', 'APT': 'aptos', 'ARB': 'arbitrum', 'OP': 'optimism',
+  'SUI': 'sui', 'SEI': 'sei-network', 'TIA': 'celestia', 'INJ': 'injective-protocol',
+  'FET': 'fetch-ai', 'RNDR': 'render-token', 'GRT': 'the-graph',
+  'AAVE': 'aave', 'MKR': 'maker', 'CRV': 'curve-dao-token', 'LDO': 'lido-dao',
+  'PEPE': 'pepe', 'WIF': 'dogwifcoin', 'BONK': 'bonk', 'FLOKI': 'floki',
+  'TRX': 'tron', 'TON': 'the-open-network', 'HBAR': 'hedera-hashgraph',
+  'VET': 'vechain', 'FTM': 'fantom', 'SAND': 'the-sandbox', 'MANA': 'decentraland',
+  'AXS': 'axie-infinity', 'ICP': 'internet-computer', 'ETC': 'ethereum-classic',
+  'BCH': 'bitcoin-cash', 'XMR': 'monero', 'ZEC': 'zcash', 'USDT': 'tether',
+  'USDC': 'usd-coin', 'DAI': 'dai', 'BUSD': 'binance-usd',
+  'TRUMP': 'official-trump', 'WLD': 'worldcoin-wld', 'PENGU': 'pudgy-penguins',
+  'JUP': 'jupiter-exchange-solana', 'W': 'wormhole', 'STRK': 'starknet',
+  'EIGEN': 'eigenlayer', 'ZRO': 'layerzero', 'ENA': 'ethena',
+  'TAO': 'bittensor', 'RENDER': 'render-token', 'AR': 'arweave',
+  'STX': 'blockstack', 'IMX': 'immutable-x', 'GALA': 'gala',
+};
+
+// Chain detection for 0x addresses
+const CHAIN_EXPLORERS = {
+  'ethereum': { name: 'Ethereum', explorer: 'https://etherscan.io/address/', rpc: 'https://eth.llamarpc.com', symbol: 'ETH', icon: '⟠' },
+  'bsc': { name: 'BSC', explorer: 'https://bscscan.com/address/', rpc: 'https://bsc-dataseed.binance.org', symbol: 'BNB', icon: '🔶' },
+  'polygon': { name: 'Polygon', explorer: 'https://polygonscan.com/address/', rpc: 'https://polygon-rpc.com', symbol: 'POL', icon: '🟣' },
+  'arbitrum': { name: 'Arbitrum', explorer: 'https://arbiscan.io/address/', rpc: 'https://arb1.arbitrum.io/rpc', symbol: 'ETH', icon: '🔵' },
+  'optimism': { name: 'Optimism', explorer: 'https://optimistic.etherscan.io/address/', rpc: 'https://mainnet.optimism.io', symbol: 'ETH', icon: '🔴' },
+  'avalanche': { name: 'Avalanche', explorer: 'https://snowtrace.io/address/', rpc: 'https://api.avax.network/ext/bc/C/rpc', symbol: 'AVAX', icon: '🔺' },
+  'base': { name: 'Base', explorer: 'https://basescan.org/address/', rpc: 'https://mainnet.base.org', symbol: 'ETH', icon: '🔷' },
+};
+
+class CryptoPrice {
+  constructor() {
+    this.cache = new Map();    // ticker → { data, ts, source }
+    this.pending = new Set();  // currently fetching tickers
+    this.listeners = [];       // UI callbacks
+    this.addrCache = new Map(); // address → { balances, ts }
+  }
+
+  // Register UI callback for when price data arrives
+  onUpdate(fn) { this.listeners.push(fn); }
+  _notify(ticker, data) { for (const fn of this.listeners) try { fn(ticker, data); } catch(_) {} }
+
+  // Get cached price (returns null if not cached or expired)
+  get(ticker) {
+    const t = ticker.toUpperCase();
+    const cached = this.cache.get(t);
+    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL) return cached.data;
+    return null;
+  }
+
+  // Inject price from P2P gossip (another peer fetched it)
+  injectFromPeer(ticker, data) {
+    const t = ticker.toUpperCase();
+    const existing = this.cache.get(t);
+    // Only accept if newer than our cache
+    if (!existing || data.fetchedAt > existing.data.fetchedAt) {
+      this.cache.set(t, { data, ts: Date.now() });
+      this._notify(t, data);
+    }
+  }
+
+  // Fetch price — checks cache first, then CoinGecko
+  async fetch(ticker) {
+    const t = ticker.toUpperCase();
+    // Check cache
+    const cached = this.get(t);
+    if (cached) return cached;
+    // Check if already fetching
+    if (this.pending.has(t)) return null;
+    if (this.pending.size >= CRYPTO_CFG.MAX_PENDING) return null;
+
+    const cgId = TICKER_MAP[t];
+    if (!cgId) return null;
+
+    this.pending.add(t);
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), CRYPTO_CFG.FETCH_TIMEOUT);
+      const url = `${CRYPTO_CFG.COINGECKO_BASE}/coins/${cgId}?localization=false&tickers=false&community_data=false&developer_data=false&sparkline=false`;
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json();
+
+      const data = {
+        ticker: t,
+        cgId,
+        name: json.name || t,
+        symbol: (json.symbol || t).toUpperCase(),
+        image: json.image?.small || '',
+        price: json.market_data?.current_price?.usd || 0,
+        change24h: json.market_data?.price_change_percentage_24h || 0,
+        marketCap: json.market_data?.market_cap?.usd || 0,
+        volume24h: json.market_data?.total_volume?.usd || 0,
+        high24h: json.market_data?.high_24h?.usd || 0,
+        low24h: json.market_data?.low_24h?.usd || 0,
+        ath: json.market_data?.ath?.usd || 0,
+        rank: json.market_cap_rank || 0,
+        fetchedAt: Date.now(),
+      };
+
+      this.cache.set(t, { data, ts: Date.now() });
+      this._notify(t, data);
+      return data;
+    } catch (e) {
+      console.warn('CryptoPrice fetch error:', t, e.message);
+      return null;
+    } finally {
+      this.pending.delete(t);
+    }
+  }
+
+  // Fetch address balances across chains via public RPC
+  async fetchAddress(addr) {
+    const cached = this.addrCache.get(addr);
+    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL * 2) return cached.balances;
+
+    const balances = [];
+    const chains = Object.entries(CHAIN_EXPLORERS);
+
+    // Fetch balances in parallel (max 3 at a time for speed)
+    const results = await Promise.allSettled(
+      chains.map(async ([chainId, chain]) => {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 5000);
+          const resp = await fetch(chain.rpc, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getBalance', params: [addr, 'latest'], id: 1 }),
+            signal: ctrl.signal,
+          });
+          clearTimeout(timer);
+          const json = await resp.json();
+          const weiHex = json.result;
+          if (weiHex && weiHex !== '0x0') {
+            const wei = parseInt(weiHex, 16);
+            const balance = wei / 1e18;
+            if (balance > 0.0001) {
+              return { chainId, chain: chain.name, symbol: chain.symbol, balance, explorer: chain.explorer + addr, icon: chain.icon };
+            }
+          }
+          return null;
+        } catch (_) { return null; }
+      })
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value) balances.push(r.value);
+    }
+
+    // Always include explorer links even without balance
+    if (balances.length === 0) {
+      balances.push({ chainId: 'ethereum', chain: 'Ethereum', symbol: 'ETH', balance: 0, explorer: CHAIN_EXPLORERS.ethereum.explorer + addr, icon: '⟠' });
+      balances.push({ chainId: 'bsc', chain: 'BSC', symbol: 'BNB', balance: 0, explorer: CHAIN_EXPLORERS.bsc.explorer + addr, icon: '🔶' });
+      balances.push({ chainId: 'polygon', chain: 'Polygon', symbol: 'POL', balance: 0, explorer: CHAIN_EXPLORERS.polygon.explorer + addr, icon: '🟣' });
+    }
+
+    this.addrCache.set(addr, { balances, ts: Date.now() });
+    return balances;
+  }
+
+  // Detect tickers in text: $BTC $ETH etc.
+  static detectTickers(text) {
+    const matches = text.match(/\$([A-Za-z]{2,10})/g);
+    if (!matches) return [];
+    return [...new Set(matches.map(m => m.slice(1).toUpperCase()).filter(t => TICKER_MAP[t]))];
+  }
+
+  // Detect 0x addresses in text
+  static detectAddresses(text) {
+    const matches = text.match(/0x[a-fA-F0-9]{40}/g);
+    return matches ? [...new Set(matches)] : [];
+  }
+
+  // Format helpers
+  static formatPrice(n) {
+    if (n >= 1000) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    if (n >= 1) return '$' + n.toFixed(2);
+    if (n >= 0.01) return '$' + n.toFixed(4);
+    return '$' + n.toFixed(8);
+  }
+  static formatLarge(n) {
+    if (n >= 1e12) return '$' + (n / 1e12).toFixed(2) + 'T';
+    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
+    return '$' + n.toFixed(0);
+  }
+  static formatBalance(n) {
+    if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    if (n >= 0.01) return n.toFixed(4);
+    return n.toFixed(8);
+  }
+}

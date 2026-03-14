@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.2.1 — ActionLog Node
+// MeshChat v1.2.2 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -29,6 +29,8 @@ class Node {
     this.profile = { bio: '', status: 'online', emoji: '', avatar: '', posts: [] };
     this.peerProfiles = new Map();
     this.stories = this.state.stories;
+    // Crypto price engine
+    this.crypto_price = new CryptoPrice();
   }
 
   async init(name) {
@@ -262,6 +264,43 @@ class Node {
     await this._emit('profile', { bio: this.profile.bio, status: this.profile.status, emoji: this.profile.emoji, avatar: this.profile.avatar });
   }
 
+  // ═══ CRYPTO PRICE — P2P cached ═══
+  async fetchCryptoPrice(ticker) {
+    const t = ticker.toUpperCase();
+    // 1. Check local cache
+    const cached = this.crypto_price.get(t);
+    if (cached) return cached;
+    // 2. Fetch from CoinGecko
+    const data = await this.crypto_price.fetch(t);
+    if (data) {
+      // 3. Gossip to all peers so they don't need to fetch
+      this._broadcastCryptoPrice(t, data);
+    }
+    return data;
+  }
+
+  _broadcastCryptoPrice(ticker, data) {
+    const msg = { type: 'crypto-price', ticker, data, hops: 0 };
+    for (const [pid] of this.peers) this.sendTo(pid, msg);
+  }
+
+  _onCryptoPrice(d, from) {
+    if (!d.ticker || !d.data) return;
+    const t = d.ticker.toUpperCase();
+    // Inject into local cache
+    this.crypto_price.injectFromPeer(t, d.data);
+    // Re-gossip if hops < 3
+    if ((d.hops || 0) < 3) {
+      const fwd = { ...d, hops: (d.hops || 0) + 1 };
+      const targets = this.gossip.pick([...this.peers.values()].map(p => p.info), [from]);
+      for (const t of targets) this.sendTo(t.id, fwd);
+    }
+  }
+
+  async fetchAddressInfo(addr) {
+    return this.crypto_price.fetchAddress(addr);
+  }
+
   async sendFile(file) {
     const ch = this.chMgr.current;
     const result = await this.ft.prepareFile(file);
@@ -282,7 +321,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.1'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.2'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
@@ -396,6 +435,7 @@ class Node {
       case 'slow-mode': if (d.channel && d.seconds!==undefined) { if (!this._slowMode) this._slowMode = {}; this._slowMode[d.channel] = d.seconds; DB.setKey('slowMode', this._slowMode); } break;
       case 'signal-relay-request': this._onRelayRequest(d, from); break;
       case 'signal-relay': this._onRelaySignal(d, from); break;
+      case 'crypto-price': this._onCryptoPrice(d, from); break;
     }
   }
 

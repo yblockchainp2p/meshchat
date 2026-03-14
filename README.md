@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.1-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.2-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -105,6 +105,23 @@ All peers sort actions by `lamport → timestamp → senderId`. This produces id
 - **File sharing** — images sent directly P2P with torrent-style distribution
 - **GIF & Sticker picker** — emoji-based GIF cards by category, 5 sticker packs (Faces, Animals, Food, Activities, Objects)
 - **@Mention notifications** — highlighted self-mentions, double-beep sound, floating notification popup, tap-to-navigate
+
+### 💰 Crypto Integration
+- **$TICKER price cards** — type `$BTC` `$ETH` etc. for live price embed (price, 24h%, volume, market cap)
+- **P2P price cache** — prices gossiped across the mesh, 1-minute TTL, no API key needed
+- **0x address scanner** — paste any 0x address, scans 7 EVM chains (ETH, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base)
+- **Multi-chain explorer links** — click to open Etherscan, BSCscan, Polygonscan etc.
+- **60+ tokens supported** — all major coins + memecoins + DeFi tokens
+
+### 💰 Crypto Price Bot
+- **$TICKER detection** — type `$BTC` `$ETH` `$SOL` etc. in any message, auto-renders price embed card
+- **Detailed embed cards** — price, 24h change, market cap, volume, high/low, rank, CoinGecko link
+- **60+ coins** — Bitcoin, Ethereum, Solana, BNB, XRP, Cardano, Dogecoin, Avalanche, Polygon, and many more
+- **P2P price gossip** — one peer fetches, all peers receive via gossip protocol (no duplicate API calls)
+- **1 minute cache** — fresh prices, zero rate limit issues across the mesh
+- **0x address detection** — paste any Ethereum-compatible address, auto-scans 7 chains for balances
+- **Multi-chain explorer** — Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base with clickable links
+- **No API key required** — CoinGecko free API + public RPC endpoints
 
 ### 🏛️ Plaza (Social Feed)
 - **Posts** — share text + images, Twitter/X style feed
@@ -266,6 +283,7 @@ meshchat/
 | `ActionLog` | **Unified event ledger** — all mutations as ordered actions |
 | `BlockChain` | **Epoch-based block closing** with SHA-256 hashing |
 | `StateBuilder` | **Derives UI state from ActionLog** — messages, posts, stories, reactions, pins, profiles |
+| `CryptoPrice` | **P2P-cached crypto price engine** — CoinGecko API, ticker detection, 0x address scanning, gossip distribution |
 
 ---
 
@@ -324,9 +342,49 @@ python3 -m http.server 8080
 
 ## Changelog
 
+### v1.2.2 — Sprint 2: Crypto Price Bot
+
+**$TICKER Price Cards (P2P Cached)**
+- Type `$BTC`, `$ETH`, `$SOL` etc. in any message → detailed embed card appears below
+- Card shows: price, 24h change (▲/▼), market cap, 24h volume, 24h high/low, CoinGecko rank
+- 60+ coins supported (BTC, ETH, SOL, BNB, XRP, ADA, DOGE, AVAX, LINK, UNI, AAVE, PEPE, WIF, TRUMP, TON, and many more)
+- **P2P gossip cache** — when one peer fetches a price, it broadcasts to the entire mesh. Other peers use the cached data instead of hitting the API. 1-minute TTL.
+- No API key needed — uses CoinGecko free public API
+- Zero IP ban risk — distributed fetching across the mesh means no single IP gets rate-limited
+
+**0x Address Detection**
+- Paste any `0x` address (40 hex chars) → multi-chain explorer card appears
+- Scans 7 chains in parallel via public RPCs: Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base
+- Shows balance per chain where funds are found
+- Click any chain → opens block explorer for that address
+- Balances cached for 2 minutes
+
+**Architecture**
+```
+User types "$BTC" → check local cache (1 min TTL)
+  → HIT: render card instantly
+  → MISS: fetch from CoinGecko → render card → gossip to all peers
+           peers receive → inject into their cache → no API call needed
+
+Result: 10 users type $BTC = 1 API call (not 10)
+```
+
 ### v1.2.1 — Sprint 1
 
-**GIF & Sticker Picker**
+**Sprint 2: Crypto Price Bot (P2P Cached)**
+- `$BTC` `$ETH` `$SOL` etc. typed in messages auto-detected — renders embed card below message
+- Embed card shows: coin icon, name, rank, price, 24h change (green/red), market cap, volume, high/low, CoinGecko link
+- **60+ coins** supported: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, AVAX, MATIC, LINK, SHIB, UNI, ATOM, NEAR, ARB, OP, SUI, PEPE, WIF, TRUMP, TON, and many more
+- **P2P price gossip**: when one peer fetches a price, it broadcasts to all peers via gossip protocol — other peers use the cached data instead of hitting the API
+- **1 minute cache TTL**: prices are fresh but shared across the entire mesh, so CoinGecko rate limits are never an issue
+- **No API key required**: uses CoinGecko free public API
+- `0x` addresses detected automatically — shows multi-chain explorer card with balances
+- **7 chains scanned**: Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base
+- Balances fetched via public RPC endpoints (LlamaRPC, Binance, Polygon, etc.) — no API key needed
+- Each chain shows: icon, name, balance, and clickable link to block explorer (Etherscan, BSScan, Polygonscan, etc.)
+- Async loading with animated placeholder while data arrives
+
+**Sprint 1: GIF/Sticker, Enhanced Polls, Mentions, Peer Search**
 - GIF picker with 15 categories (trending, reactions, love, happy, sad, angry, dance, facepalm, hug, laugh, wow, clap, ok, yes, no)
 - Sticker picker with 5 packs: Faces, Animals, Food, Activities, Objects
 - Stickers render large (64px) in chat; single-emoji messages auto-detected as stickers
