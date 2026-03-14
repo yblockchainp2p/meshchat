@@ -1612,7 +1612,7 @@ class StateBuilder {
             _verified: a.data.verified ?? true, sig: a.sig,
             replyTo: a.data.replyTo||null, fileMeta: a.data.fileMeta||null,
             poll: a.data.poll||null, encrypted: a.data.encrypted||null,
-            targetId: a.data.targetId||null,
+            targetId: a.data.targetId||null, _plazaShare: a.data._plazaShare||null,
           });
           arr.sort((x,y) => (x.lamport-y.lamport)||(x.ts-y.ts));
           if (arr.length > CFG.HISTORY) arr.splice(0, arr.length - CFG.HISTORY);

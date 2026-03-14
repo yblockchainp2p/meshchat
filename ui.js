@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1.7
+// 8. UI RENDERING — MeshChat v1.1.8
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -275,7 +275,15 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
 
   // Link preview (basic — extract domain from first URL)
   let linkPreviewHtml = '';
-  if (text && !fileMeta) {
+  // Check for plaza share card
+  const shareData = N.store.getAll().find(m => m.msgId === msgId)?._plazaShare;
+  if (shareData) {
+    linkPreviewHtml = `<div class="plaza-share-inner" style="background:var(--bg2);border:1px solid var(--brd);border-radius:8px;padding:10px;margin-top:6px;cursor:pointer;" data-plaza-goto="${esc(shareData.postId)}">
+      <div style="font-size:10px;color:var(--cyan);font-weight:600;margin-bottom:4px;">🏛️ PLAZA</div>
+      <div style="font-size:12px;color:var(--t1);"><b>${esc(shareData.ownerName)}</b>: ${esc(shareData.preview)}</div>
+      <div style="font-size:10px;color:var(--cyan);margin-top:6px;">View in Plaza →</div>
+    </div>`;
+  } else if (text && !fileMeta) {
     const urlMatch = text.match(/https?:\/\/[^\s]+/);
     if (urlMatch) {
       try {
@@ -299,10 +307,11 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
     }
   }
 
+  const displayText = shareData ? '' : parseText(text);
   d.innerHTML = `
     ${!self ? `<div class="ms" style="color:${c}"><span class="msg-sender-click" data-sid="${esc(senderId)}" style="cursor:pointer;">${esc(sender)}</span>${badgesHtml}${vBadge}${rl ? ` <span class="mr ${rc}">${rl}</span>` : ''}</div>` : ''}
     ${replyHtml}
-    <div class="mb">${parseText(text)}${editedTag}${fileContent}${pollHtml}${linkPreviewHtml}</div>
+    <div class="mb">${displayText}${editedTag}${fileContent}${pollHtml}${linkPreviewHtml}</div>
     ${reactionsHtml}
     ${threadHtml}
     <div class="mt">${ts}${route !== 'self' ? ` · ${hops}h` : ''}${verified && self ? ' ✓' : ''}${receiptHtml}</div>`;
@@ -310,6 +319,25 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   // Hashtag clicks
   d.querySelectorAll('.hashtag').forEach(h => {
     h.addEventListener('click', (e) => { e.preventDefault(); switchChannel(h.dataset.ch); });
+  });
+
+  // Plaza share card click → navigate to Plaza and highlight post
+  d.querySelectorAll('[data-plaza-goto]').forEach(card => {
+    const handler = (e) => {
+      e.stopPropagation(); e.preventDefault();
+      const pid = card.dataset.plazaGoto;
+      document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
+      document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
+      const pt = document.querySelector('.stab[data-t="plaza"]');
+      if (pt) pt.classList.add('on');
+      document.getElementById('pnPlaza')?.classList.add('on');
+      refreshPlaza();
+      const sb = document.querySelector('.sidebar');
+      if (sb && window.innerWidth <= 700) { sb.classList.add('mob-open'); const tog = document.getElementById('mobToggle'); if (tog) { tog.classList.add('active'); tog.innerHTML = '&times;'; } }
+      setTimeout(() => { const el = document.querySelector(`.live-post[data-postid="${CSS.escape(pid)}"]`); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.style.outline = '2px solid var(--cyan)'; setTimeout(() => el.style.outline = '', 2500); } }, 300);
+    };
+    card.addEventListener('click', handler);
+    card.addEventListener('touchend', handler, { passive: false });
   });
 
   // Thumbnail click → request full image from P2P swarm
@@ -1399,57 +1427,16 @@ function openGlobalSearch() {
 // SHARE POST TO CHANNEL (ephemeral card, 15s)
 // ═══════════════════════════════════════
 function sharePostToChannel(postId, ownerName, preview) {
-  const el = document.getElementById('msgs');
-  const card = document.createElement('div');
-  card.className = 'm m-sys plaza-share-card';
-  card.innerHTML = `
-    <div class="plaza-share-inner">
-      <div class="plaza-share-badge">🏛️ Plaza</div>
-      <div class="plaza-share-text"><b>${esc(ownerName)}</b>: ${esc(preview)}</div>
-      <div class="plaza-share-btn" data-goto="${esc(postId)}">View in Plaza →</div>
-    </div>`;
-  const goToPlaza = (e) => {
-    e.stopPropagation();
-    e.preventDefault();
-    document.querySelectorAll('.stab').forEach(x => x.classList.remove('on'));
-    document.querySelectorAll('.spanel').forEach(x => x.classList.remove('on'));
-    const plazaTab = document.querySelector('.stab[data-t="plaza"]');
-    if (plazaTab) plazaTab.classList.add('on');
-    document.getElementById('pnPlaza')?.classList.add('on');
-    refreshPlaza();
-    const sb = document.querySelector('.sidebar');
-    if (sb && window.innerWidth <= 700) {
-      sb.classList.add('mob-open');
-      const toggle = document.getElementById('mobToggle');
-      if (toggle) { toggle.classList.add('active'); toggle.innerHTML = '&times;'; }
-    }
-    setTimeout(() => {
-      const postEl = document.querySelector(`.live-post[data-postid="${CSS.escape(postId)}"]`);
-      if (postEl) {
-        postEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        postEl.style.outline = '2px solid var(--cyan)';
-        setTimeout(() => { postEl.style.outline = ''; }, 2500);
-      }
-    }, 300);
-  };
-  const btn = card.querySelector('.plaza-share-btn');
-  btn.addEventListener('click', goToPlaza);
-  btn.addEventListener('touchend', goToPlaza, { passive: false });
-
-  el.appendChild(card);
-  el.scrollTop = el.scrollHeight;
-
-  // Auto-remove after 5 minutes
-  setTimeout(() => {
-    card.style.transition = 'opacity 0.5s, max-height 0.5s';
-    card.style.opacity = '0';
-    card.style.maxHeight = '0';
-    card.style.overflow = 'hidden';
-    setTimeout(() => card.remove(), 600);
-  }, 5 * 60 * 1000);
-
-  // Broadcast via ActionLog so all peers see it
-  N.sendChat(`🏛️ shared: ${ownerName} — "${preview}" → #plaza/${postId}`);
+  // Send as a regular message with plaza share metadata — renders as card everywhere
+  const shareText = `🏛️ ${ownerName}: "${preview}"`;
+  const ch = N.chMgr.current;
+  N._emit('msg', {
+    text: shareText, hops: 0,
+    _plazaShare: { postId, ownerName, preview }
+  }, { channel: ch }).then(a => {
+    showMsg({ sender: N.name, senderId: N.id, text: shareText, time: a.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: a.id });
+    refreshChannelList();
+  });
   showToastSimple('Shared to channel!');
 }
 
