@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.1.9-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.0-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -37,9 +37,9 @@ When you open MeshChat, your browser generates a unique cryptographic identity. 
 
 ## Architecture: ActionLog Chain
 
-MeshChat v1.1.9 introduces a unified event ledger inspired by blockchain principles.
+MeshChat v1.2.0 introduces a unified event ledger inspired by blockchain principles.
 
-### The Problem (pre-v1.1.9)
+### The Problem (pre-v1.2.0)
 
 Every feature (messages, posts, likes, deletes, reactions, pins...) had its own sync mechanism. When a peer went offline and came back, deleted items could resurrect, likes could be lost, and posts could duplicate. Each fix introduced new edge cases — it was an endless game of whack-a-mole.
 

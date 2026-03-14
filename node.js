@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.1.9 — ActionLog Node
+// MeshChat v1.2.0 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -83,7 +83,13 @@ class Node {
     this.reactions = this.state.reactions;
     this.pins = this.state.pins;
     this.stories = this.state.stories;
-    // Sync profiles
+
+    // FIRST: clear all posts in peerProfiles (prevents deleted posts surviving)
+    for (const [, prof] of this.peerProfiles) {
+      prof.posts = [];
+    }
+
+    // Sync profiles from state
     for (const [pid, p] of this.state.profiles) {
       if (pid !== this.id) {
         const ex = this.peerProfiles.get(pid) || {};
@@ -95,20 +101,21 @@ class Node {
         this.profile.avatar = p.avatar || this.profile.avatar;
       }
     }
-    // Sync ALL post owners into peerProfiles (even those without 'profile' actions)
+
+    // Repopulate posts for all post owners (including those without profile actions)
     const postOwners = new Set();
     for (const post of this.state.posts) { if (post.senderId) postOwners.add(post.senderId); }
     for (const pid of postOwners) {
       if (pid === this.id) continue;
       if (!this.peerProfiles.has(pid)) {
-        // Find name from posts
         const firstPost = this.state.posts.find(p => p.senderId === pid);
         this.peerProfiles.set(pid, { bio: '', status: 'offline', emoji: '', avatar: '', name: firstPost?.senderName || pid.slice(0,8), posts: this.state.getUserPosts(pid) });
       } else {
-        const ex = this.peerProfiles.get(pid);
-        ex.posts = this.state.getUserPosts(pid);
+        this.peerProfiles.get(pid).posts = this.state.getUserPosts(pid);
       }
     }
+
+    // Own posts
     this.profile.posts = this.state.getUserPosts(this.id);
   }
 
@@ -269,7 +276,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.9'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.0'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
