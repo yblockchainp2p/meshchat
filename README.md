@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.0-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.1-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -100,9 +100,11 @@ All peers sort actions by `lamport → timestamp → senderId`. This produces id
 - **Replies** — quote-reply with visual thread
 - **Forwarding** — forward messages across channels
 - **Editing & deleting** — edit your own messages, admins can delete any
-- **Polls** — multi-option polls with real-time vote tracking
+- **Polls** — multi-option polls with real-time vote tracking, multi-select, anonymous mode, countdown timer
 - **Threads** — Slack-style reply chains with "N replies" counter
 - **File sharing** — images sent directly P2P with torrent-style distribution
+- **GIF & Sticker picker** — emoji-based GIF cards by category, 5 sticker packs (Faces, Animals, Food, Activities, Objects)
+- **@Mention notifications** — highlighted self-mentions, double-beep sound, floating notification popup, tap-to-navigate
 
 ### 🏛️ Plaza (Social Feed)
 - **Posts** — share text + images, Twitter/X style feed
@@ -130,6 +132,7 @@ All peers sort actions by `lamport → timestamp → senderId`. This produces id
 - **Trending channels** — most active channels in the last hour
 - **Channel statistics** — hourly activity chart, top contributors
 - **Global search** — full-text search across all channels
+- **Peer search** — filter connected and DHT peers by name or ID
 - **Shareable links** — `#channel` and `#channel/msgId` deep links
 
 ### 🎨 Customization
@@ -316,6 +319,38 @@ cd meshchat
 python3 -m http.server 8080
 # Open http://localhost:8080 in two browser tabs to test P2P
 ```
+
+---
+
+## Changelog
+
+### v1.2.1 — Sprint 1
+
+**GIF & Sticker Picker**
+- GIF picker with 15 categories (trending, reactions, love, happy, sad, angry, dance, facepalm, hug, laugh, wow, clap, ok, yes, no)
+- Sticker picker with 5 packs: Faces, Animals, Food, Activities, Objects
+- Stickers render large (64px) in chat; single-emoji messages auto-detected as stickers
+- Accessible via attach menu (+) → GIF or Sticker
+
+**Enhanced Polls**
+- Multi-select mode — voters can choose multiple options
+- Anonymous mode — voter identities hidden from results
+- Countdown timer — 1min, 5min, 15min, 30min, or 1hr options
+- Expired polls automatically lock and show "Poll ended" badge
+- Timer auto-refreshes every 5 seconds in the UI
+
+**@Mention Notifications**
+- Self-mentions highlighted in yellow (`@yourname` stands out)
+- Special double-beep notification sound for mentions
+- Floating notification popup (top-right) with "tap to go" to channel
+- Mentions trigger notification even when viewing the same channel
+- Clicking @mention opens that user's profile card
+- Mention history tracked (last 50)
+
+**Peer Search**
+- Search input added to Peers panel
+- Filters P2P connected peers and DHT peers by name or ID
+- Real-time filtering as you type
 
 ---
 

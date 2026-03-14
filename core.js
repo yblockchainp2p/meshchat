@@ -1721,10 +1721,25 @@ class StateBuilder {
         if (!a.targetId) break;
         const poll = this.polls.get(a.targetId);
         if (poll) {
-          for (const opt of poll.options) opt.votes = (opt.votes||[]).filter(v => v !== a.senderId);
-          if (poll.options[a.data.optIdx]) {
-            if (!poll.options[a.data.optIdx].votes) poll.options[a.data.optIdx].votes = [];
-            poll.options[a.data.optIdx].votes.push(a.senderId);
+          // Check if poll expired
+          if (poll.expiresAt && poll.expiresAt < Date.now()) break;
+
+          if (poll.multiSelect) {
+            // Multi-select: toggle this option without removing others
+            const opt = poll.options[a.data.optIdx];
+            if (opt) {
+              if (!opt.votes) opt.votes = [];
+              const vi = opt.votes.indexOf(a.senderId);
+              if (vi >= 0) opt.votes.splice(vi, 1);
+              else opt.votes.push(a.senderId);
+            }
+          } else {
+            // Single-select: remove from all, add to selected
+            for (const opt of poll.options) opt.votes = (opt.votes||[]).filter(v => v !== a.senderId);
+            if (poll.options[a.data.optIdx]) {
+              if (!poll.options[a.data.optIdx].votes) poll.options[a.data.optIdx].votes = [];
+              poll.options[a.data.optIdx].votes.push(a.senderId);
+            }
           }
           for (const [,arr] of this.messages) {
             const msg = arr.find(m => m.msgId === a.targetId);

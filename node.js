@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.2.0 — ActionLog Node
+// MeshChat v1.2.1 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -194,9 +194,15 @@ class Node {
     renderChannel();
   }
 
-  async sendPoll(question, options) {
+  async sendPoll(question, options, opts = {}) {
     const ch = this.chMgr.current;
-    const poll = { question, options: options.map(o => ({ text: o, votes: [] })) };
+    const poll = {
+      question,
+      options: options.map(o => ({ text: o, votes: [] })),
+      multiSelect: opts.multiSelect || false,
+      anonymous: opts.anonymous || false,
+      expiresAt: opts.expiresAt || 0,
+    };
     await this._emit('msg', { text: '📊 ' + question, poll, hops: 0 }, { channel: ch });
     refreshChannelList();
   }
@@ -276,7 +282,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.0'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.1'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);

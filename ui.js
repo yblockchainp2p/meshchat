@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.2.0
+// 8. UI RENDERING — MeshChat v1.2.1
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -26,22 +26,71 @@ const unreadCounts = new Map(); // channel -> count
 
 // Notification sound (Web Audio API — no file needed)
 let _audioCtx;
-function playNotifSound() {
+function playNotifSound(type) {
   try {
     if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = _audioCtx.createOscillator();
     const gain = _audioCtx.createGain();
     osc.connect(gain); gain.connect(_audioCtx.destination);
-    osc.frequency.value = 880; osc.type = 'sine';
-    gain.gain.setValueAtTime(0.15, _audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + 0.3);
-    osc.start(_audioCtx.currentTime);
-    osc.stop(_audioCtx.currentTime + 0.3);
+
+    if (type === 'mention') {
+      // Special mention sound — double beep, higher pitch
+      osc.frequency.value = 1200; osc.type = 'sine';
+      gain.gain.setValueAtTime(0.2, _audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + 0.15);
+      osc.start(_audioCtx.currentTime);
+      osc.stop(_audioCtx.currentTime + 0.15);
+      // Second beep
+      const osc2 = _audioCtx.createOscillator();
+      const gain2 = _audioCtx.createGain();
+      osc2.connect(gain2); gain2.connect(_audioCtx.destination);
+      osc2.frequency.value = 1400; osc2.type = 'sine';
+      gain2.gain.setValueAtTime(0.2, _audioCtx.currentTime + 0.18);
+      gain2.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + 0.35);
+      osc2.start(_audioCtx.currentTime + 0.18);
+      osc2.stop(_audioCtx.currentTime + 0.35);
+    } else {
+      osc.frequency.value = 880; osc.type = 'sine';
+      gain.gain.setValueAtTime(0.15, _audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + 0.3);
+      osc.start(_audioCtx.currentTime);
+      osc.stop(_audioCtx.currentTime + 0.3);
+    }
   } catch (_) {}
 }
 
+// Mention tracking
+const mentionHistory = [];
+const MAX_MENTIONS = 50;
+
+function showMentionNotification(sender, text, channel) {
+  mentionHistory.unshift({ sender, text, channel, ts: Date.now() });
+  if (mentionHistory.length > MAX_MENTIONS) mentionHistory.pop();
+
+  // Show floating notification
+  const notif = document.createElement('div');
+  notif.className = 'mention-notification';
+  notif.innerHTML = `
+    <div class="mention-notif-header">@ Mentioned by ${esc(sender)}</div>
+    <div class="mention-notif-text">${esc(text.slice(0, 100))}</div>
+    <div class="mention-notif-ch">#${esc(channel)} · tap to go</div>`;
+  notif.style.cursor = 'pointer';
+  notif.addEventListener('click', () => {
+    switchChannel(channel);
+    notif.remove();
+  });
+  document.body.appendChild(notif);
+  setTimeout(() => { if (notif.parentNode) notif.remove(); }, 6000);
+}
+
 function showToast(sender, text, type, channel) {
-  if (channel === N.chMgr?.current) return;
+  if (channel === N.chMgr?.current) {
+    // Even if on same channel, check for mentions
+    if (N.name && text && text.toLowerCase().includes('@' + N.name.toLowerCase())) {
+      playNotifSound('mention');
+    }
+    return;
+  }
 
   if (channel) {
     unreadChannels.add(channel);
@@ -50,8 +99,19 @@ function showToast(sender, text, type, channel) {
   updateUnreadDots();
   refreshChannelList();
 
+  // Check for mention
+  const isMention = N.name && text && text.toLowerCase().includes('@' + N.name.toLowerCase());
+  if (isMention) type = 'mention';
+
   // Play sound if not muted
-  if (!channel || !N.isMuted(channel)) playNotifSound();
+  if (!channel || !N.isMuted(channel)) {
+    playNotifSound(isMention ? 'mention' : undefined);
+  }
+
+  // Show special mention notification
+  if (isMention && channel) {
+    showMentionNotification(sender, text, channel);
+  }
 
   const box = document.getElementById('toastBox');
   const t = document.createElement('div');
@@ -113,6 +173,11 @@ function clearUnread(channel) {
 
 function parseText(text) {
   let out = esc(text);
+  // Check if this is a sticker message (single large emoji)
+  const stickerMatch = out.match(/^[\p{Emoji}\u200d\uFE0F]+$/u);
+  if (stickerMatch && out.length <= 8) {
+    return `<span class="msg-sticker">${out}</span>`;
+  }
   // Markdown: code blocks first (protect from other formatting)
   out = out.replace(/`([^`]+)`/g, '<code class="md-code">$1</code>');
   // Bold **text**
@@ -125,8 +190,12 @@ function parseText(text) {
   out = out.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener" class="msg-link">$1</a>');
   // #channel links
   out = out.replace(/#([a-zA-Z0-9_-]+)/g, '<span class="hashtag" data-ch="$1">#$1</span>');
-  // @user mentions
-  out = out.replace(/@([a-zA-Z0-9_#]+)/g, '<span class="mention">@$1</span>');
+  // @user mentions — highlight self mentions
+  out = out.replace(/@([a-zA-Z0-9_#]+)/g, (match, name) => {
+    const isSelf = N.name && name.toLowerCase() === N.name.toLowerCase();
+    const cls = isSelf ? 'mention mention-self' : 'mention';
+    return `<span class="${cls}" data-mention="${esc(name)}">@${esc(name)}</span>`;
+  });
   // Plaza link — "check Plaza tab" becomes clickable
   out = out.replace(/check Plaza tab/g, '<span class="plaza-link" style="color:var(--cyan);cursor:pointer;text-decoration:underline;">open Plaza ↗</span>');
   return out;
@@ -244,19 +313,40 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   let pollHtml = '';
   if (pData) {
     const totalVotes = pData.options.reduce((s, o) => s + (o.votes?.length || 0), 0);
-    pollHtml = `<div class="poll-box">`;
+    const isMulti = pData.multiSelect || false;
+    const isAnon = pData.anonymous || false;
+    const isExpired = pData.expiresAt && pData.expiresAt < Date.now();
+    const timeLeft = pData.expiresAt ? Math.max(0, Math.ceil((pData.expiresAt - Date.now()) / 1000)) : 0;
+
+    let timerHtml = '';
+    if (pData.expiresAt) {
+      if (isExpired) {
+        timerHtml = '<div class="poll-timer-badge expired">⏱ Poll ended</div>';
+      } else {
+        const m = Math.floor(timeLeft / 60), s = timeLeft % 60;
+        timerHtml = `<div class="poll-timer-badge">⏱ ${m}:${String(s).padStart(2, '0')} remaining</div>`;
+      }
+    }
+
+    let headerBadges = '';
+    if (isMulti) headerBadges += '<span class="poll-multi-hint">✓ Multi-select</span> ';
+    if (isAnon) headerBadges += '<span class="poll-anon-badge">🕶 Anonymous</span>';
+
+    pollHtml = `<div class="poll-box">${headerBadges ? `<div style="margin-bottom:4px;">${headerBadges}</div>` : ''}`;
     for (let i = 0; i < pData.options.length; i++) {
       const o = pData.options[i];
       const cnt = o.votes?.length || 0;
       const pct = totalVotes ? Math.round(cnt / totalVotes * 100) : 0;
       const voted = o.votes?.includes(N.id);
-      pollHtml += `<div class="poll-opt${voted ? ' poll-voted' : ''}" data-mid="${esc(msgId)}" data-oi="${i}">
+      const disabled = isExpired ? ' style="opacity:0.6;pointer-events:none;"' : '';
+      const multiClass = isMulti && voted ? ' poll-multi-selected' : '';
+      pollHtml += `<div class="poll-opt${voted ? ' poll-voted' : ''}${multiClass}" data-mid="${esc(msgId)}" data-oi="${i}" data-multi="${isMulti}"${disabled}>
         <div class="poll-bar" style="width:${pct}%"></div>
-        <span class="poll-text">${esc(o.text)}</span>
-        <span class="poll-pct">${cnt} (${pct}%)</span>
+        <span class="poll-text">${isMulti && voted ? '☑ ' : ''}${esc(o.text)}</span>
+        <span class="poll-pct">${cnt}${isAnon ? '' : ''} (${pct}%)</span>
       </div>`;
     }
-    pollHtml += `<div class="poll-total">${totalVotes} vote${totalVotes !== 1 ? 's' : ''}</div></div>`;
+    pollHtml += `<div class="poll-total">${totalVotes} vote${totalVotes !== 1 ? 's' : ''}${isAnon ? ' · anonymous' : ''}</div>${timerHtml}</div>`;
   }
 
   // Reactions
@@ -319,6 +409,36 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   // Hashtag clicks
   d.querySelectorAll('.hashtag').forEach(h => {
     h.addEventListener('click', (e) => { e.preventDefault(); switchChannel(h.dataset.ch); });
+  });
+
+  // Mention clicks → show profile
+  d.querySelectorAll('.mention').forEach(m => {
+    m.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const mentionName = m.dataset.mention;
+      if (!mentionName) return;
+      // Find peer ID by name
+      for (const [id, p] of N.peers) {
+        if (p.info.name.toLowerCase() === mentionName.toLowerCase()) {
+          showProfile(id);
+          return;
+        }
+      }
+      // Check own name
+      if (N.name && mentionName.toLowerCase() === N.name.toLowerCase()) {
+        showProfile(N.id);
+        return;
+      }
+      // Check DHT
+      if (N.rt) {
+        for (const [id, info] of N.rt.all) {
+          if ((info.name || '').toLowerCase() === mentionName.toLowerCase()) {
+            showProfile(id);
+            return;
+          }
+        }
+      }
+    });
   });
 
   // Plaza share card click → navigate to Plaza and highlight post
@@ -772,16 +892,24 @@ function trustBar(score) {
   </div>`;
 }
 
-function refreshPeers() {
+function refreshPeers(filterQuery) {
   const el = document.getElementById('pList');
   const list = [...N.peers.values()];
   const dhtOnly = [];
   if (N.rt) for (const [id, info] of N.rt.all) if (!N.peers.has(id)) dhtOnly.push(info);
 
-  if (!list.length && !dhtOnly.length) { el.innerHTML = '<div class="empty">No peers yet</div>'; return; }
+  // Apply search filter
+  const q = (filterQuery || '').toLowerCase().trim();
+  const filteredList = q ? list.filter(p => p.info.name.toLowerCase().includes(q) || p.info.id.toLowerCase().includes(q)) : list;
+  const filteredDht = q ? dhtOnly.filter(n => (n.name||'').toLowerCase().includes(q) || n.id.toLowerCase().includes(q)) : dhtOnly;
+
+  if (!filteredList.length && !filteredDht.length) {
+    el.innerHTML = q ? '<div class="peer-no-results">No peers matching "' + esc(q) + '"</div>' : '<div class="empty">No peers yet</div>';
+    return;
+  }
 
   let html = '';
-  for (const p of list) {
+  for (const p of filteredList) {
     const c = hue(p.info.name);
     const age = Date.now() - p.seen;
     const st = age < 5000 ? 'active' : Math.round(age / 1000) + 's';
@@ -802,7 +930,7 @@ function refreshPeers() {
       </div>
     </div>`;
   }
-  for (const n of dhtOnly.slice(0, 20)) {
+  for (const n of filteredDht.slice(0, 20)) {
     const c = hue(n.name || '?');
     const ts = N.trust.getScore(n.id);
     html += `<div class="peer" style="opacity:0.6">
@@ -1323,6 +1451,216 @@ function closeAttachMenu() {
 }
 
 // ═══════════════════════════════════════
+// GIF PICKER (Tenor-style with fallback)
+// ═══════════════════════════════════════
+const GIF_CATS = ['trending','reactions','love','happy','sad','angry','yes','no','dance','facepalm','hug','laugh','wow','clap','ok'];
+let _gifCat = 'trending';
+let _gifSearch = '';
+let _gifCache = new Map();
+
+function openGifPicker() {
+  const ov = document.getElementById('gifPickerOverlay');
+  ov.style.display = 'flex';
+  ov.innerHTML = `<div class="gif-picker">
+    <div class="gif-picker-header">
+      <input type="text" id="gifSearchIn" placeholder="Search GIFs..." autofocus>
+      <span class="gif-picker-close" id="gifPickerClose">✕</span>
+    </div>
+    <div class="gif-picker-cats">${GIF_CATS.map(c => `<div class="gif-picker-cat${c === _gifCat ? ' on' : ''}" data-cat="${c}">${c}</div>`).join('')}</div>
+    <div class="gif-picker-grid" id="gifGrid"><div class="gif-picker-loading">Loading GIFs...</div></div>
+  </div>`;
+
+  document.getElementById('gifPickerClose').addEventListener('click', () => { ov.style.display = 'none'; });
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.style.display = 'none'; });
+
+  ov.querySelectorAll('.gif-picker-cat').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _gifCat = btn.dataset.cat;
+      _gifSearch = '';
+      document.getElementById('gifSearchIn').value = '';
+      ov.querySelectorAll('.gif-picker-cat').forEach(c => c.classList.remove('on'));
+      btn.classList.add('on');
+      loadGifs(_gifCat);
+    });
+  });
+
+  let _gifDebounce = null;
+  document.getElementById('gifSearchIn').addEventListener('input', (e) => {
+    clearTimeout(_gifDebounce);
+    _gifDebounce = setTimeout(() => {
+      _gifSearch = e.target.value.trim();
+      if (_gifSearch.length >= 2) loadGifs(_gifSearch);
+      else loadGifs(_gifCat);
+    }, 300);
+  });
+
+  loadGifs(_gifCat);
+}
+
+function loadGifs(query) {
+  const grid = document.getElementById('gifGrid');
+  if (!grid) return;
+
+  // Check cache
+  if (_gifCache.has(query)) {
+    renderGifGrid(_gifCache.get(query));
+    return;
+  }
+
+  grid.innerHTML = '<div class="gif-picker-loading">Loading GIFs...</div>';
+
+  // Use a curated emoji/kaomoji fallback set + generated GIF-like cards
+  // Since we can't access Tenor API from P2P client, we generate fun animated text cards
+  const fallbackGifs = generateGifCards(query);
+  _gifCache.set(query, fallbackGifs);
+  renderGifGrid(fallbackGifs);
+}
+
+function generateGifCards(query) {
+  // Curated GIF-like emoji animations for common categories
+  const gifSets = {
+    'trending': ['😂','🔥','❤️','👀','💀','😭','🤣','✨','🥺','👏','💪','🙌','🤯','😤','🎉','💯'],
+    'reactions': ['👍','👎','🤦','🤷','😮','🙄','😏','🤝','🫡','💅','🤌','😶','🥴','😵‍💫','🫠','😈'],
+    'love': ['❤️','💕','😍','🥰','💘','💖','💗','💝','😘','🫶','💞','❤️‍🔥','💋','🥹','😻','❣️'],
+    'happy': ['😀','😃','😄','😁','😆','🥳','🎊','🎉','🤗','😊','☺️','🌟','🌈','🎵','💃','🕺'],
+    'sad': ['😢','😭','🥺','😔','💔','😿','🥲','😞','😥','😰','😫','🥀','☹️','💧','😩','😣'],
+    'angry': ['😡','🤬','😤','👊','💢','🔥','💥','⚡','😾','👿','🗯️','💣','☠️','🫨','😠','🤯'],
+    'yes': ['✅','👍','💯','🙌','✔️','🎯','👌','🤝','💪','⭐','🏆','🥇','👏','🫡','😎','🤙'],
+    'no': ['❌','👎','🚫','🙅','✋','⛔','🤚','😑','💀','🫣','😒','🙃','😐','🛑','🚷','❎'],
+    'dance': ['💃','🕺','🎶','🎵','🪩','🎸','🥁','🎺','🎤','🎧','🔊','🪘','🎼','🫨','🤸','🕴️'],
+    'facepalm': ['🤦','😑','🫣','😶','🤷','😐','🙈','😬','🫥','💆','🤦‍♂️','🤦‍♀️','😓','🫠','😮‍💨','🫤'],
+    'hug': ['🤗','🫂','💕','❤️','🥰','😊','☺️','🫶','💗','🤝','🙏','💞','🥹','🫰','💛','🧸'],
+    'laugh': ['😂','🤣','😆','😹','💀','🫠','😭','🤪','😜','😝','🤭','😏','😸','🤣','🙃','😅'],
+    'wow': ['😮','🤯','😲','🫢','😱','🤩','⭐','✨','💫','🌟','👀','😳','🤤','🫡','😵','💥'],
+    'clap': ['👏','🙌','💪','🎊','🔥','⭐','💯','🤝','✨','🏆','🎉','🫶','👐','🤲','🥂','🍾'],
+    'ok': ['👌','👍','✅','🤙','😎','💯','✔️','🆗','🤝','⭕','🙆','🫡','😌','💪','🎯','🤌'],
+  };
+
+  let emojis = gifSets[query] || gifSets['trending'];
+
+  // If searching, filter across all sets
+  if (!gifSets[query]) {
+    emojis = [];
+    const q = query.toLowerCase();
+    for (const [cat, set] of Object.entries(gifSets)) {
+      if (cat.includes(q)) emojis.push(...set);
+    }
+    if (!emojis.length) {
+      // Fallback: show trending
+      emojis = gifSets['trending'];
+    }
+  }
+
+  return emojis.map((e, i) => ({
+    id: `stk-${query}-${i}`,
+    emoji: e,
+    label: query,
+  }));
+}
+
+function renderGifGrid(gifs) {
+  const grid = document.getElementById('gifGrid');
+  if (!grid) return;
+
+  if (!gifs.length) {
+    grid.innerHTML = '<div class="gif-picker-loading">No GIFs found</div>';
+    return;
+  }
+
+  grid.innerHTML = '';
+  const colors = ['#ff6b6b33','#ffd93d33','#6bcb7733','#4ecdc433','#45b7d133','#a78bfa33','#f8719d33','#ff922b33'];
+  gifs.forEach((g, i) => {
+    const div = document.createElement('div');
+    div.className = 'gif-picker-item';
+    div.style.cssText = `background:${colors[i % colors.length]};display:flex;align-items:center;justify-content:center;font-size:48px;`;
+    div.innerHTML = g.emoji;
+    div.title = g.label;
+    div.addEventListener('click', () => {
+      sendGifMessage(g.emoji, g.label);
+      document.getElementById('gifPickerOverlay').style.display = 'none';
+    });
+    grid.appendChild(div);
+  });
+}
+
+function sendGifMessage(emoji, label) {
+  const ch = N.chMgr.current;
+  N._emit('msg', {
+    text: emoji, hops: 0,
+    gifUrl: null, isSticker: true, stickerEmoji: emoji, stickerLabel: label
+  }, { channel: ch }).then(a => {
+    showMsg({ sender: N.name, senderId: N.id, text: emoji, time: a.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: a.id });
+    refreshChannelList();
+  });
+}
+
+// ═══════════════════════════════════════
+// STICKER PICKER
+// ═══════════════════════════════════════
+const STICKER_PACKS = {
+  'Faces': ['😀','😃','😄','😁','😆','🥹','😅','🤣','😂','🙂','😉','😊','😇','🥰','😍','🤩','😘','😋','😛','🤪','😝','🤑','🤗','🤭','🤫','🤔','🫡','😐','😑','😶','🙄','😏','😒','😮‍💨','🤤','😴','🥱','😲','😳','🥺','🥹','😢','😭','😤','😡','🤬','🤯','😵','😵‍💫','🥴','😎','🤠','🥳','🫨','😱','😨','😰','😥','😓'],
+  'Animals': ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐻‍❄️','🐨','🐯','🦁','🐮','🐷','🐸','🐵','🙈','🙉','🙊','🐒','🐔','🐧','🐦','🐤','🦆','🦅','🦉','🦇','🐺','🐗','🐴','🦄','🐝','🦋','🐌','🐞','🐜','🪲','🕷️','🦂','🐢','🐍','🦎','🦖','🐙','🦑','🦀','🐡','🐠','🐟','🐬','🐳','🐋','🦈','🐊'],
+  'Food': ['🍕','🍔','🍟','🌭','🍿','🧂','🥓','🥚','🍳','🧇','🥞','🧈','🥐','🍞','🥖','🥨','🧀','🥗','🥙','🥪','🌮','🌯','🍝','🍜','🍲','🍛','🍣','🍱','🥟','🦪','🍤','🍙','🍚','🍘','🍥','🥮','🧁','🍰','🎂','🍮','🍭','🍬','🍫','🍩','🍪','🥧','🧊','🍺','🍻','🥂','🍷','🍸','🍹','☕','🧃'],
+  'Activities': ['⚽','🏀','🏈','⚾','🥎','🏐','🏉','🎾','🏓','🏸','🥊','🏋️','🤸','🤼','🤺','🏇','🚴','🏊','🏄','🤽','🧗','🪂','🏂','⛷️','🎮','🕹️','🎯','🎲','🎰','🧩','♟️','🎭','🎨','🎸','🎹','🥁','🎺','🎤','🎧'],
+  'Objects': ['💡','🔦','🕯️','💣','🪓','🔫','💊','💉','🩹','🩺','🔬','🔭','📡','🛸','🚀','⭐','🌟','✨','⚡','🔥','💧','🌊','❄️','☃️','🌈','☀️','🌙','⭕','❌','❓','❗','💤','💢','💬','💭','🗨️','🗯️','♻️','🔰'],
+};
+let _stickerCat = 'Faces';
+
+function openStickerPicker() {
+  const ov = document.getElementById('stickerPickerOverlay');
+  ov.style.display = 'flex';
+  const cats = Object.keys(STICKER_PACKS);
+  const catIcons = { Faces: '😀', Animals: '🐶', Food: '🍕', Activities: '⚽', Objects: '💡' };
+
+  ov.innerHTML = `<div class="sticker-picker">
+    <div class="gif-picker-header">
+      <span style="font-size:13px;font-weight:600;flex:1;">Stickers</span>
+      <span class="gif-picker-close" id="stickerPickerClose">✕</span>
+    </div>
+    <div class="sticker-cats">${cats.map(c => `<div class="sticker-cat${c === _stickerCat ? ' on' : ''}" data-cat="${c}">${catIcons[c] || c[0]} ${c}</div>`).join('')}</div>
+    <div class="sticker-grid" id="stickerGrid"></div>
+  </div>`;
+
+  document.getElementById('stickerPickerClose').addEventListener('click', () => { ov.style.display = 'none'; });
+  ov.addEventListener('click', (e) => { if (e.target === ov) ov.style.display = 'none'; });
+
+  ov.querySelectorAll('.sticker-cat').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _stickerCat = btn.dataset.cat;
+      ov.querySelectorAll('.sticker-cat').forEach(c => c.classList.remove('on'));
+      btn.classList.add('on');
+      renderStickerGrid();
+    });
+  });
+
+  renderStickerGrid();
+}
+
+function renderStickerGrid() {
+  const grid = document.getElementById('stickerGrid');
+  if (!grid) return;
+  const stickers = STICKER_PACKS[_stickerCat] || [];
+  grid.innerHTML = stickers.map(s => `<div class="sticker-item" data-sticker="${s}">${s}</div>`).join('');
+  grid.querySelectorAll('.sticker-item').forEach(item => {
+    item.addEventListener('click', () => {
+      sendStickerMessage(item.dataset.sticker);
+      document.getElementById('stickerPickerOverlay').style.display = 'none';
+    });
+  });
+}
+
+function sendStickerMessage(emoji) {
+  const ch = N.chMgr.current;
+  N._emit('msg', {
+    text: emoji, hops: 0,
+    isSticker: true, stickerEmoji: emoji
+  }, { channel: ch }).then(a => {
+    showMsg({ sender: N.name, senderId: N.id, text: emoji, time: a.ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: a.id });
+    refreshChannelList();
+  });
+}
+
+// ═══════════════════════════════════════
 // POLL CREATION UI
 // ═══════════════════════════════════════
 let _pollOptions = ['', ''];
@@ -1358,7 +1696,11 @@ function sendPollFromUI() {
   const opts = _pollOptions.map(o => o.trim()).filter(Boolean);
   if (!q) return alert('Please enter a question');
   if (opts.length < 2) return alert('At least 2 options needed');
-  N.sendPoll(q, opts);
+  const multiSelect = document.getElementById('pollMulti')?.checked || false;
+  const anonymous = document.getElementById('pollAnon')?.checked || false;
+  const timerSec = parseInt(document.getElementById('pollTimer')?.value || '0');
+  const expiresAt = timerSec > 0 ? Date.now() + timerSec * 1000 : 0;
+  N.sendPoll(q, opts, { multiSelect, anonymous, expiresAt });
   document.getElementById('pollCreate').style.display = 'none';
 }
 
@@ -1595,6 +1937,20 @@ function updateTypingUI() {
   bar.innerHTML = `<em>${esc(names)}</em> ${users.length === 1 ? 'is' : 'are'} typing${dots}`;
 }
 setInterval(updateTypingUI, 1000);
+
+// Poll timer countdown — re-render to update timer badges
+let _pollTimerInterval = null;
+function startPollTimerRefresh() {
+  if (_pollTimerInterval) return;
+  _pollTimerInterval = setInterval(() => {
+    // Check if any visible polls have active timers
+    const timerBadges = document.querySelectorAll('.poll-timer-badge:not(.expired)');
+    if (timerBadges.length > 0) {
+      scheduleRender(); // Re-render to update timer countdowns
+    }
+  }, 5000); // every 5 seconds
+}
+startPollTimerRefresh();
 
 // ═══════════════════════════════════════
 // PINNED MESSAGES BAR
@@ -2345,6 +2701,8 @@ document.querySelectorAll('#attachMenu .attach-item').forEach(item => {
     if (act === 'image') document.getElementById('fileIn').click();
     else if (act === 'poll') togglePollCreate();
     else if (act === 'emoji') { _emojiTarget = 'mIn'; toggleEmojiPicker(); }
+    else if (act === 'gif') openGifPicker();
+    else if (act === 'sticker') openStickerPicker();
   });
 });
 document.getElementById('fileIn').addEventListener('change', async (e) => {
@@ -2488,6 +2846,11 @@ document.getElementById('searchIn').addEventListener('keydown', (e) => {
     e.target.value = '';
     renderChannel();
   }
+});
+
+// Peer search
+document.getElementById('peerSearchIn')?.addEventListener('input', (e) => {
+  refreshPeers(e.target.value);
 });
 
 // Setup

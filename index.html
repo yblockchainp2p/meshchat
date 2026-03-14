@@ -7,10 +7,10 @@
 <meta name="description" content="Decentralized P2P encrypted social platform">
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕸️</text></svg>">
-<title>MeshChat v1.2.0</title>
+<title>MeshChat v1.2.1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=1.2.0">
+<link rel="stylesheet" href="style.css?v=1.2.1">
 </head>
 <body>
 
@@ -18,7 +18,7 @@
 <div class="ov" id="ov">
   <div class="cd">
     <div class="cd-t">MeshChat</div>
-    <div class="cd-s">Crypto Identity + E2E Encrypted DM + DHT Mesh</div>
+    <div class="cd-s">Crypto Identity + E2E Encrypted DM + DHT Mesh + Stickers & Polls</div>
     <div class="fd">
       <label>Username</label>
       <input id="nIn" placeholder="Enter your name..." maxlength="24" autocomplete="off">
@@ -29,7 +29,9 @@
       🔒 ECDH + AES-GCM — end-to-end encrypted DMs<br>
       💾 IndexedDB — messages persist across refresh<br>
       🌐 Kademlia DHT + Gossip — scalable mesh<br>
-      📡 Channels — type #name to create/join
+      📡 Channels — type #name to create/join<br>
+      🎭 Stickers &amp; GIFs — express with style<br>
+      📊 Enhanced polls — multi-select, anonymous, timed
     </div>
     <button class="jb" id="jBtn">Join Network &rarr;</button>
     <div style="text-align:center;margin-top:10px">
@@ -40,6 +42,12 @@
 
 <!-- TOAST NOTIFICATIONS -->
 <div id="toastBox"></div>
+
+<!-- GIF PICKER -->
+<div class="gif-picker-overlay" id="gifPickerOverlay" style="display:none;"></div>
+
+<!-- STICKER PICKER -->
+<div class="sticker-picker-overlay" id="stickerPickerOverlay" style="display:none;"></div>
 
 <!-- PROFILE MODAL -->
 <div class="profile-modal" id="profileModal">
@@ -103,7 +111,10 @@
       </div>
       <div id="plazaFeed"></div>
     </div>
-    <div class="spanel" id="pnPeers"><div id="pList"></div></div>
+    <div class="spanel" id="pnPeers">
+      <div class="peer-search-wrap"><input class="peer-search-input" id="peerSearchIn" placeholder="🔍 Search peers..." maxlength="40"></div>
+      <div id="pList"></div>
+    </div>
     <div class="spanel" id="pnSaved"><div id="savedList"></div></div>
     <div class="spanel" id="pnDht"><div id="dhtV"></div></div>
     <div class="spanel" id="pnNet">
@@ -140,6 +151,21 @@
       <div class="poll-create-head">📊 Create Poll <span id="pollCreateClose" style="cursor:pointer;float:right;">✕</span></div>
       <input class="poll-create-input" id="pollQ" placeholder="Ask a question..." maxlength="200">
       <div id="pollOpts"></div>
+      <div class="poll-settings">
+        <label class="poll-setting-label"><input type="checkbox" id="pollMulti"> Multi-select</label>
+        <label class="poll-setting-label"><input type="checkbox" id="pollAnon"> Anonymous</label>
+        <div class="poll-timer-wrap">
+          <label class="poll-setting-label">⏱ Timer:</label>
+          <select id="pollTimer" class="poll-timer-select">
+            <option value="0">No limit</option>
+            <option value="60">1 min</option>
+            <option value="300">5 min</option>
+            <option value="900">15 min</option>
+            <option value="1800">30 min</option>
+            <option value="3600">1 hour</option>
+          </select>
+        </div>
+      </div>
       <div style="display:flex;gap:6px;margin-top:6px;">
         <button class="admin-btn" id="pollAddOpt" style="flex:1;">+ Add option</button>
         <button class="sbtn" id="pollSend" style="width:auto;padding:0 14px;font-size:11px;">Send Poll</button>
@@ -155,6 +181,8 @@
           <div class="attach-menu" id="attachMenu" style="display:none;">
             <div class="attach-item" data-act="image"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Image</div>
             <div class="attach-item" data-act="poll"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="9" width="7" height="12" rx="1"/></svg> Poll</div>
+            <div class="attach-item" data-act="gif"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><text x="12" y="15" text-anchor="middle" font-size="8" fill="currentColor" stroke="none">GIF</text></svg> GIF</div>
+            <div class="attach-item" data-act="sticker"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg> Sticker</div>
             <div class="attach-item" data-act="emoji"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg> Emoji</div>
           </div>
         </div>
@@ -165,12 +193,12 @@
   </main>
 </div>
 
-<script src="core.js?v=1.2.0"></script>
-<script src="node.js?v=1.2.0"></script>
-<script src="ui.js?v=1.2.0"></script>
+<script src="core.js?v=1.2.1"></script>
+<script src="node.js?v=1.2.1"></script>
+<script src="ui.js?v=1.2.1"></script>
 <script>
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js?v=1.2.0').then(reg => {
+  navigator.serviceWorker.register('sw.js?v=1.2.1').then(reg => {
     setInterval(() => reg.update(), 60000);
     reg.addEventListener('updatefound', () => {
       const nw = reg.installing; if (!nw) return;
