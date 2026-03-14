@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.1.8
+// 8. UI RENDERING — MeshChat v1.1.9
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];

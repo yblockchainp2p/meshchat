@@ -1410,15 +1410,16 @@ class ActionLog {
     if (!action?.id) return false;
     if (this.actions.has(action.id)) return false;
 
-    // Dependency check
+    // Dependency check: some action types need their target to exist first
     if (action.targetId && this._needsDep(action)) {
       if (!this._hasTarget(action.targetId)) {
         this.orphans.set(action.id, action);
+        console.log('ActionLog ORPHAN:', action.type, action.id.slice(0,12), 'waiting for', action.targetId?.slice(0,12));
         return true;
       }
     }
 
-    // Skip if target already deleted (except delete actions themselves)
+    // Skip if target already deleted (except delete actions — they always apply)
     if (action.targetId && !this._isDeleteType(action.type)) {
       if (this._isDeleted(action.targetId)) return false;
     }
@@ -1428,6 +1429,9 @@ class ActionLog {
     DB.saveAction(action);
     this._resolveOrphans(action.id);
     this._notify(action);
+    if (action.type === 'post-delete' || action.type === 'delete') {
+      console.log('ActionLog DELETE applied:', action.type, 'target:', action.targetId?.slice(0,12), 'total actions:', this.actions.size);
+    }
     return true;
   }
 
@@ -1443,7 +1447,9 @@ class ActionLog {
   _isDeleteType(type) { return type === 'delete' || type === 'post-delete' || type === 'story-delete'; }
 
   _needsDep(action) {
-    return new Set(['edit','delete','like','reaction','pin','unpin','poll-vote','post-delete','story-delete']).has(action.type);
+    // Only these types need their target to exist first
+    // Deletes are always accepted — if target hasn't arrived yet, it will be blocked by _isDeleted when it does
+    return new Set(['edit','like','reaction','pin','unpin','poll-vote']).has(action.type);
   }
 
   _hasTarget(targetId) {

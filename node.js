@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.1.8 — ActionLog Node
+// MeshChat v1.1.9 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -269,7 +269,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.8'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.1.9'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
@@ -427,7 +427,12 @@ class Node {
     } else if (a.type==='post') { if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); }
     else if (a.type==='delete'||a.type==='edit'||a.type==='reaction'||a.type==='pin') scheduleRender();
     else if (a.type==='story'||a.type==='story-delete') ui();
-    else if (a.type==='post-delete'||a.type==='like') { if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); }
+    else if (a.type==='post-delete'||a.type==='like') {
+      // Force full rebuild to ensure post deletion propagates to all compat layers
+      this.state.rebuild();
+      this._syncCompat();
+      if (typeof refreshPlazaFeed==='function') refreshPlazaFeed();
+    }
     else if (a.type==='profile') ui();
   }
 
@@ -440,7 +445,13 @@ class Node {
   _onChainSync(d, from) {
     if (!Array.isArray(d.actions)) return;
     const added = this.actionLog.merge(d.actions);
-    if (added > 0) { this.state.rebuild(); this._syncCompat(); scheduleRender(); refreshChannelList(); if (typeof refreshPlazaFeed==='function') refreshPlazaFeed(); console.log('Chain sync: +' + added + ' from ' + from.slice(0,8)); }
+    // Always rebuild state after sync for consistency
+    this.state.rebuild();
+    this._syncCompat();
+    scheduleRender();
+    refreshChannelList();
+    if (typeof refreshPlazaFeed === 'function') refreshPlazaFeed();
+    if (added > 0) console.log('Chain sync: +' + added + ' from ' + from.slice(0,8) + ' | posts:' + this.state.posts.length);
   }
 
   // ═══ HANDSHAKE ═══
