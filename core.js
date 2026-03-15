@@ -1872,15 +1872,12 @@ class CryptoPrice {
     }
   }
 
-  // Fetch price — checks cache first, then CoinGecko
+  // Fetch price — always fresh from CoinGecko (no cache-first)
   async fetch(ticker) {
     const t = ticker.toUpperCase();
-    // Check cache
-    const cached = this.get(t);
-    if (cached) return cached;
-    // Check if already fetching
-    if (this.pending.has(t)) return null;
-    if (this.pending.size >= CRYPTO_CFG.MAX_PENDING) return null;
+    // Only skip if already fetching same ticker right now
+    if (this.pending.has(t)) return this.get(t);
+    if (this.pending.size >= CRYPTO_CFG.MAX_PENDING) return this.get(t);
 
     const cgId = TICKER_MAP[t];
     if (!cgId) return null;
@@ -1927,10 +1924,10 @@ class CryptoPrice {
   // Fetch token info by contract address (0x...) via CoinGecko
   // Tries multiple chains: ethereum, bsc, polygon, arbitrum, etc.
   async fetchByContract(addr) {
-    const cached = this.addrCache.get(addr);
-    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL) return cached.data;
-
-    if (this.pending.has('addr:' + addr)) return null;
+    if (this.pending.has('addr:' + addr)) {
+      const cached = this.addrCache.get(addr);
+      return cached ? cached.data : null;
+    }
     this.pending.add('addr:' + addr);
 
     // CoinGecko platform IDs for contract lookup

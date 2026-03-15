@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.6-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.7-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -342,6 +342,15 @@ python3 -m http.server 8080
 ---
 
 ## Changelog
+
+### v1.2.7 — Ephemeral crypto queries
+
+- **Changed:** `$BTC` / `0x` mesajlar artık ActionLog'a kaydedilmiyor — geçici (ephemeral) olarak gösteriliyor
+- **Changed:** Her sorgu **taze** API çağrısı yapıyor — cache'den değil, her zaman güncel fiyat
+- **Changed:** Diğer peer'lar `crypto-query` mesajıyla ephemeral olarak görüyor (sync edilmiyor)
+- **Changed:** 3dk sonra geçici mesaj kalıyor ama yeniden bağlanan peer'lara iletilmiyor
+- **Added:** `_onCryptoQuery` handler — peer'dan gelen geçici sorguları render eder
+- Yeni peer bağlandığında eski crypto sorguları görmez (sadece kendi oturumunda)
 
 ### v1.2.6 — Bugfix: Message expiry + ad height
 

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.2.6 — ActionLog Node
+// MeshChat v1.2.7 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -140,6 +140,30 @@ class Node {
     }
     if (!this._lastSentTime) this._lastSentTime = {};
     this._lastSentTime[ch] = Date.now();
+
+    // Check if message is a crypto query ($TICKER or 0x address)
+    const hasTickers = CryptoPrice.detectTickers(text).length > 0;
+    const hasAddrs = CryptoPrice.detectAddresses(text).length > 0;
+    if (hasTickers || hasAddrs) {
+      // Ephemeral: show locally + broadcast to peers, but do NOT save to ActionLog
+      const ephId = 'eph-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+      const ts = Date.now();
+      // Show locally
+      showMsg({ sender: this.name, senderId: this.id, text, time: ts, route: 'self', hops: 0, self: true, channel: ch, verified: true, msgId: ephId });
+      // Broadcast ephemeral to peers
+      for (const [pid] of this.peers) {
+        this.sendTo(pid, { type: 'crypto-query', text, sender: this.name, senderId: this.id, channel: ch, ts, ephId });
+      }
+      // Fetch prices and gossip
+      for (const ticker of CryptoPrice.detectTickers(text)) {
+        this.fetchCryptoPrice(ticker);
+      }
+      for (const addr of CryptoPrice.detectAddresses(text)) {
+        this.fetchAddressInfo(addr);
+      }
+      return;
+    }
+
     if (this.chMgr.isDM(ch)) { await this.sendDM(text, ch, replyTo); return; }
     const data = { text, hops: 0 };
     if (replyTo) data.replyTo = replyTo;
@@ -302,14 +326,30 @@ class Node {
     }
   }
 
+  // Ephemeral crypto query from peer — show the message locally without saving to ActionLog
+  _onCryptoQuery(d, from) {
+    if (!d.text || !d.channel || !d.sender) return;
+    if (this.blocked.has(d.senderId)) return;
+    const ch = d.channel;
+    // Show ephemeral message in UI (not saved)
+    showMsg({
+      sender: d.sender, senderId: d.senderId, text: d.text, time: d.ts || Date.now(),
+      route: 'gossip', hops: 0, self: false, channel: ch,
+      verified: true, msgId: d.ephId || ('eph-' + Date.now()),
+    });
+    // If we're on this channel, also trigger price fetch (will use gossip cache or fetch fresh)
+    for (const ticker of CryptoPrice.detectTickers(d.text)) {
+      this.fetchCryptoPrice(ticker);
+    }
+    for (const addr of CryptoPrice.detectAddresses(d.text)) {
+      this.fetchAddressInfo(addr);
+    }
+  }
+
   async fetchAddressInfo(addr) {
-    // Check local cache first
-    const cached = this.crypto_price.addrCache.get(addr);
-    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL) return cached.data;
-    // Fetch from CoinGecko contract API
+    // Always fetch fresh
     const data = await this.crypto_price.fetchByContract(addr);
     if (data) {
-      // Gossip token data to peers
       this._broadcastCryptoPrice('addr:' + addr, data);
     }
     return data;
@@ -335,7 +375,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.6'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.7'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
@@ -450,6 +490,7 @@ class Node {
       case 'signal-relay-request': this._onRelayRequest(d, from); break;
       case 'signal-relay': this._onRelaySignal(d, from); break;
       case 'crypto-price': this._onCryptoPrice(d, from); break;
+      case 'crypto-query': this._onCryptoQuery(d, from); break;
     }
   }
 
