@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.5-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.6-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -342,6 +342,12 @@ python3 -m http.server 8080
 ---
 
 ## Changelog
+
+### v1.2.6 — Bugfix: Message expiry + ad height
+
+- **Fixed:** $BTC / 0x mesajları 3dk sonra tamamen siliniyor (sadece kart değil, tüm mesaj)
+- **Fixed:** Reklam iframe yüksekliği 50px ile sınırlandı (320x50 format)
+- **Fixed:** "Token not found" kartlarına da expiry eklendi
 
 ### v1.2.5 — Bugfix: outerHTML crash + rank badge
 

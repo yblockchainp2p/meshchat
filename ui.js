@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.2.5
+// 8. UI RENDERING — MeshChat v1.2.6
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -690,7 +690,7 @@ function _renderCryptoCard(data) {
 
 function _renderAddrCard(addr, data) {
   if (!data) {
-    return `<div class="crypto-addr-card loaded">
+    return `<div class="crypto-addr-card loaded" data-fetched="${Date.now()}">
       <div class="crypto-addr-header">🔗 ${addr.slice(0, 8)}...${addr.slice(-6)}</div>
       <div class="crypto-card-error">Token not found on CoinGecko</div>
       <div class="crypto-card-footer">
@@ -780,16 +780,24 @@ function _registerCryptoListener() {
 }
 
 // ═══ CRYPTO CARD EXPIRY ═══
-// Fade out crypto cards after 3 minutes
+// After 3 minutes, remove the entire message that contains crypto cards
 setInterval(() => {
-  const cards = document.querySelectorAll('.crypto-card[data-fetched], .crypto-addr-card.loaded[data-fetched]');
+  const cards = document.querySelectorAll('.crypto-card[data-fetched], .crypto-addr-card[data-fetched]');
   const now = Date.now();
   cards.forEach(card => {
     const fetched = parseInt(card.dataset.fetched || '0');
     if (fetched && now - fetched > 180000) { // 3 minutes
-      card.style.opacity = '0';
-      card.style.transition = 'opacity 0.5s';
-      setTimeout(() => card.remove(), 600);
+      // Find parent message element and remove entirely
+      const msgEl = card.closest('.m');
+      if (msgEl) {
+        msgEl.style.opacity = '0';
+        msgEl.style.transition = 'opacity 0.5s';
+        setTimeout(() => msgEl.remove(), 600);
+      } else {
+        card.style.opacity = '0';
+        card.style.transition = 'opacity 0.5s';
+        setTimeout(() => card.remove(), 600);
+      }
     }
   });
 }, 10000); // check every 10s

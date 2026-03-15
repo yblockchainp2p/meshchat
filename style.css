@@ -678,8 +678,9 @@ html,body{height:100%;overflow:hidden;font-family:var(--body);background:var(--b
 .crypto-addr-chain-bal{font-family:var(--mono);font-size:10px;color:var(--t2);}
 
 /* ═══ Ad spacing fix ═══ */
-.ad-inject-zone{margin:0;padding:0;line-height:0;}
-.ad-inject-zone iframe,.ad-iframe{max-width:100%;display:block;}
-.ad-script-slot{margin:0;padding:0;overflow:hidden;}
+.ad-inject-zone{margin:0;padding:0;line-height:0;overflow:hidden;}
+.ad-inject-zone iframe,.ad-iframe{max-width:320px;max-height:50px;display:block;border:none;overflow:hidden;}
+.ad-script-slot{margin:0;padding:0;overflow:hidden;max-height:60px;}
 .ad-script-slot:empty{display:none;}
+.ad-script-slot .ad-iframe{max-width:320px;max-height:50px;width:320px;height:50px;}
 

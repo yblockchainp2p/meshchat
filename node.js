@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.2.5 — ActionLog Node
+// MeshChat v1.2.6 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -335,7 +335,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.5'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.6'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);
