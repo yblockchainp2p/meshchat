@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.2.3
+// 8. UI RENDERING — MeshChat v1.2.4
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -666,7 +666,7 @@ function _renderCryptoCard(data) {
   const changeColor = data.change24h >= 0 ? 'var(--green)' : 'var(--red)';
   const changeIcon = data.change24h >= 0 ? '▲' : '▼';
   const changeStr = (data.change24h >= 0 ? '+' : '') + data.change24h.toFixed(2) + '%';
-  return `<div class="crypto-card">
+  return `<div class="crypto-card" data-fetched="${data.fetchedAt || Date.now()}">
     <div class="crypto-card-header">
       ${data.image ? `<img class="crypto-card-icon" src="${esc(data.image)}" alt="">` : ''}
       <div class="crypto-card-name">${esc(data.name)} <span class="crypto-card-symbol">${esc(data.symbol)}</span></div>
@@ -702,7 +702,7 @@ function _renderAddrCard(addr, data) {
   const changeColor = data.change24h >= 0 ? 'var(--green)' : 'var(--red)';
   const changeIcon = data.change24h >= 0 ? '▲' : '▼';
   const changeStr = (data.change24h >= 0 ? '+' : '') + data.change24h.toFixed(2) + '%';
-  return `<div class="crypto-card">
+  return `<div class="crypto-card" data-fetched="${data.fetchedAt || Date.now()}">
     <div class="crypto-card-header">
       ${data.image ? `<img class="crypto-card-icon" src="${esc(data.image)}" alt="">` : ''}
       <div class="crypto-card-name">${esc(data.name)} <span class="crypto-card-symbol">${esc(data.symbol)}</span></div>
@@ -754,6 +754,44 @@ async function _loadCryptoEmbeds(container, text) {
     card.outerHTML = _renderAddrCard(addr, data);
   }
 }
+
+// ═══ CRYPTO P2P UPDATE LISTENER ═══
+// When price data arrives via gossip from another peer, re-render any visible placeholder cards
+let _cryptoListenerRegistered = false;
+function _registerCryptoListener() {
+  if (_cryptoListenerRegistered || !N.crypto_price) return;
+  _cryptoListenerRegistered = true;
+  N.crypto_price.onUpdate((key, data) => {
+    // key is either "BTC" or "addr:0x..."
+    const msgs = document.getElementById('msgs');
+    if (!msgs) return;
+
+    if (key.startsWith('addr:')) {
+      const addr = key.slice(5);
+      const cards = msgs.querySelectorAll(`.crypto-addr-card[data-crypto-addr="${addr}"]`);
+      cards.forEach(card => { card.outerHTML = _renderAddrCard(addr, data); });
+    } else {
+      // Ticker card — update loading placeholders
+      const cards = msgs.querySelectorAll(`.crypto-card[data-crypto-ticker="${key}"]`);
+      cards.forEach(card => { card.outerHTML = _renderCryptoCard(data); });
+    }
+  });
+}
+
+// ═══ CRYPTO CARD EXPIRY ═══
+// Fade out crypto cards after 3 minutes
+setInterval(() => {
+  const cards = document.querySelectorAll('.crypto-card[data-fetched], .crypto-addr-card.loaded[data-fetched]');
+  const now = Date.now();
+  cards.forEach(card => {
+    const fetched = parseInt(card.dataset.fetched || '0');
+    if (fetched && now - fetched > 180000) { // 3 minutes
+      card.style.opacity = '0';
+      card.style.transition = 'opacity 0.5s';
+      setTimeout(() => card.remove(), 600);
+    }
+  });
+}, 10000); // check every 10s
 
 function sys(t) {
   const el = document.getElementById('msgs');
@@ -2990,6 +3028,9 @@ async function go() {
   if (!n) return document.getElementById('nIn').focus();
   document.getElementById('ov').classList.add('gone');
   await N.init(n);
+
+  // Register crypto price P2P listener
+  _registerCryptoListener();
 
   // URL routing: read hash and navigate
   handleUrlRoute();

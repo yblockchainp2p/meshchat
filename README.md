@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.3-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.4-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -342,6 +342,13 @@ python3 -m http.server 8080
 ---
 
 ## Changelog
+
+### v1.2.4 — Bugfix: Crypto P2P sync + card expiry
+
+- **Fixed:** 0x token data now properly syncs to other peers via P2P gossip (was only showing on sender's side)
+- **Fixed:** Crypto price cards auto-fade and disappear after 3 minutes
+- **Fixed:** When a peer receives gossiped price data, placeholder cards update in real-time
+- **Fixed:** Ad spacing below channel ads removed
 
 ### v1.2.3 — Sprint 2: Crypto Price Bot
 

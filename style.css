@@ -677,3 +677,9 @@ html,body{height:100%;overflow:hidden;font-family:var(--body);background:var(--b
 .crypto-addr-chain-name{flex:1;font-weight:500;font-size:11px;}
 .crypto-addr-chain-bal{font-family:var(--mono);font-size:10px;color:var(--t2);}
 
+/* ═══ Ad spacing fix ═══ */
+.ad-inject-zone{margin:0;padding:0;line-height:0;}
+.ad-inject-zone iframe,.ad-iframe{max-width:100%;display:block;}
+.ad-script-slot{margin:0;padding:0;overflow:hidden;}
+.ad-script-slot:empty{display:none;}
+
