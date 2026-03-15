@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.2.4
+// 8. UI RENDERING — MeshChat v1.2.5
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -656,7 +656,8 @@ function showMsg({ sender, senderId, text, time, route, hops, self, channel, ver
   el.scrollTop = el.scrollHeight;
 
   // Async: load crypto price data for embed cards
-  if (text && N.crypto_price) {
+  // Only trigger if element is in real DOM (not in DocumentFragment)
+  if (text && N.crypto_price && d.parentNode && d.parentNode.nodeType !== 11) {
     _loadCryptoEmbeds(d, text);
   }
 }
@@ -867,6 +868,24 @@ function renderChannel() {
   el.appendChild = origAppend;
   el.appendChild(frag);
   el.scrollTop = el.scrollHeight;
+
+  // Load crypto embeds now that elements are in real DOM
+  if (N.crypto_price) {
+    el.querySelectorAll('.crypto-card[data-crypto-ticker], .crypto-addr-card[data-crypto-addr]').forEach(card => {
+      const ticker = card.dataset.cryptoTicker;
+      const addr = card.dataset.cryptoAddr;
+      if (ticker) {
+        const cached = N.crypto_price.get(ticker);
+        if (cached) { card.outerHTML = _renderCryptoCard(cached); }
+        else { N.fetchCryptoPrice(ticker); } // will trigger via listener
+      }
+      if (addr) {
+        const cached = N.crypto_price.addrCache.get(addr);
+        if (cached && cached.data) { card.outerHTML = _renderAddrCard(addr, cached.data); }
+        else { N.fetchAddressInfo(addr); } // will trigger via listener
+      }
+    });
+  }
 
   // Initialize ad iframes (blob URL approach)
   _initAdIframes(el);
