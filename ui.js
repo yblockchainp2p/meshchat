@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// 8. UI RENDERING — MeshChat v1.2.2
+// 8. UI RENDERING — MeshChat v1.2.3
 // ═══════════════════════════════════════
 const N = new Node();
 const REACTIONS = ['👍', '😂', '❤️', '🔥', '😮', '👎'];
@@ -687,20 +687,41 @@ function _renderCryptoCard(data) {
   </div>`;
 }
 
-function _renderAddrCard(addr, balances) {
-  const shortAddr = addr.slice(0, 8) + '...' + addr.slice(-6);
-  let chainsHtml = '';
-  for (const b of balances) {
-    const balStr = b.balance > 0 ? CryptoPrice.formatBalance(b.balance) + ' ' + b.symbol : '—';
-    chainsHtml += `<a href="${esc(b.explorer)}" target="_blank" rel="noopener" class="crypto-addr-chain">
-      <span class="crypto-addr-chain-icon">${b.icon}</span>
-      <span class="crypto-addr-chain-name">${esc(b.chain)}</span>
-      <span class="crypto-addr-chain-bal">${balStr}</span>
-    </a>`;
+function _renderAddrCard(addr, data) {
+  if (!data) {
+    return `<div class="crypto-addr-card loaded">
+      <div class="crypto-addr-header">🔗 ${addr.slice(0, 8)}...${addr.slice(-6)}</div>
+      <div class="crypto-card-error">Token not found on CoinGecko</div>
+      <div class="crypto-card-footer">
+        <a href="https://etherscan.io/address/${esc(addr)}" target="_blank" rel="noopener" class="crypto-card-link">Etherscan ↗</a>
+        <a href="https://www.dextools.io/app/ether/pair-explorer/${esc(addr)}" target="_blank" rel="noopener" class="crypto-card-link">DexTools ↗</a>
+      </div>
+    </div>`;
   }
-  return `<div class="crypto-addr-card loaded">
-    <div class="crypto-addr-header">🔗 ${shortAddr}</div>
-    <div class="crypto-addr-chains">${chainsHtml}</div>
+  // Render same style as $TICKER card but with platform badge
+  const changeColor = data.change24h >= 0 ? 'var(--green)' : 'var(--red)';
+  const changeIcon = data.change24h >= 0 ? '▲' : '▼';
+  const changeStr = (data.change24h >= 0 ? '+' : '') + data.change24h.toFixed(2) + '%';
+  return `<div class="crypto-card">
+    <div class="crypto-card-header">
+      ${data.image ? `<img class="crypto-card-icon" src="${esc(data.image)}" alt="">` : ''}
+      <div class="crypto-card-name">${esc(data.name)} <span class="crypto-card-symbol">${esc(data.symbol)}</span></div>
+      ${data.platform ? `<span class="crypto-card-rank">${data.platformIcon || '⟠'} ${esc(data.platform)}</span>` : ''}
+      ${data.rank ? `<span class="crypto-card-rank">#${data.rank}</span>` : ''}
+    </div>
+    <div class="crypto-card-price">${CryptoPrice.formatPrice(data.price)}</div>
+    <div class="crypto-card-change" style="color:${changeColor};">${changeIcon} ${changeStr} <span class="crypto-card-period">24h</span></div>
+    <div class="crypto-card-stats">
+      <div class="crypto-card-stat"><span class="crypto-stat-label">Market Cap</span><span class="crypto-stat-val">${CryptoPrice.formatLarge(data.marketCap)}</span></div>
+      <div class="crypto-card-stat"><span class="crypto-stat-label">Volume 24h</span><span class="crypto-stat-val">${CryptoPrice.formatLarge(data.volume24h)}</span></div>
+      <div class="crypto-card-stat"><span class="crypto-stat-label">High 24h</span><span class="crypto-stat-val">${CryptoPrice.formatPrice(data.high24h)}</span></div>
+      <div class="crypto-card-stat"><span class="crypto-stat-label">Low 24h</span><span class="crypto-stat-val">${CryptoPrice.formatPrice(data.low24h)}</span></div>
+    </div>
+    <div class="crypto-card-footer">
+      <a href="https://www.coingecko.com/en/coins/${esc(data.cgId)}" target="_blank" rel="noopener" class="crypto-card-link">CoinGecko ↗</a>
+      <a href="https://www.dextools.io/app/ether/pair-explorer/${esc(addr)}" target="_blank" rel="noopener" class="crypto-card-link">DexTools ↗</a>
+      <span class="crypto-card-age">${_cryptoAge(data.fetchedAt)}</span>
+    </div>
   </div>`;
 }
 
@@ -729,12 +750,8 @@ async function _loadCryptoEmbeds(container, text) {
   for (const addr of addrs) {
     const card = container.querySelector(`.crypto-addr-card[data-crypto-addr="${addr}"]`);
     if (!card) continue;
-    const balances = await N.fetchAddressInfo(addr);
-    if (balances && balances.length) {
-      card.outerHTML = _renderAddrCard(addr, balances);
-    } else {
-      card.innerHTML = `<div class="crypto-card-error">${esc(addr.slice(0, 10))}... — scan failed</div>`;
-    }
+    const data = await N.fetchAddressInfo(addr);
+    card.outerHTML = _renderAddrCard(addr, data);
   }
 }
 

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════
-// MeshChat v1.2.2 — ActionLog Node
+// MeshChat v1.2.3 — ActionLog Node
 // ═══════════════════════════════════════
 class Node {
   constructor() {
@@ -286,19 +286,33 @@ class Node {
 
   _onCryptoPrice(d, from) {
     if (!d.ticker || !d.data) return;
-    const t = d.ticker.toUpperCase();
-    // Inject into local cache
-    this.crypto_price.injectFromPeer(t, d.data);
+    const t = d.ticker;
+    // Handle both ticker ($BTC) and address (addr:0x...) keys
+    if (t.startsWith('addr:')) {
+      const addr = t.slice(5);
+      this.crypto_price.addrCache.set(addr, { data: d.data, ts: Date.now() });
+    } else {
+      this.crypto_price.injectFromPeer(t.toUpperCase(), d.data);
+    }
     // Re-gossip if hops < 3
     if ((d.hops || 0) < 3) {
       const fwd = { ...d, hops: (d.hops || 0) + 1 };
       const targets = this.gossip.pick([...this.peers.values()].map(p => p.info), [from]);
-      for (const t of targets) this.sendTo(t.id, fwd);
+      for (const tgt of targets) this.sendTo(tgt.id, fwd);
     }
   }
 
   async fetchAddressInfo(addr) {
-    return this.crypto_price.fetchAddress(addr);
+    // Check local cache first
+    const cached = this.crypto_price.addrCache.get(addr);
+    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL) return cached.data;
+    // Fetch from CoinGecko contract API
+    const data = await this.crypto_price.fetchByContract(addr);
+    if (data) {
+      // Gossip token data to peers
+      this._broadcastCryptoPrice('addr:' + addr, data);
+    }
+    return data;
   }
 
   async sendFile(file) {
@@ -321,7 +335,7 @@ class Node {
   }
 
   // ═══ BOOTSTRAP + WEBRTC ═══
-  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.2'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
+  _setStatus(s) { this._status = s; const t = document.getElementById('statusTag'); if (!t) return; t.textContent = 'v1.2.3'; t.className = s === 'connected' ? 'tag tag-on' : s === 'reconnecting' ? 'tag tag-warn' : 'tag tag-off'; }
   startWakeDetection() {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') setTimeout(() => this._checkAndReconnect(), 500); });
     let lt = Date.now(); setInterval(() => { const n = Date.now(), d = n-lt; lt = n; if (d > 8000) setTimeout(() => this._checkAndReconnect(), 500); }, 3000);

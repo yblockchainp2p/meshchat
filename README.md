@@ -8,7 +8,7 @@ Built entirely with WebRTC, running in your browser. Your messages travel direct
 
 [**Try it live →**](https://yblockchainp2p.github.io/meshchat/)
 
-![Version](https://img.shields.io/badge/Version-1.2.2-22d3ee?style=flat-square)
+![Version](https://img.shields.io/badge/Version-1.2.3-22d3ee?style=flat-square)
 ![P2P](https://img.shields.io/badge/P2P-WebRTC-22d3ee?style=flat-square)
 ![E2E](https://img.shields.io/badge/Encryption-E2E%20AES--256-10b981?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)
@@ -109,8 +109,9 @@ All peers sort actions by `lamport → timestamp → senderId`. This produces id
 ### 💰 Crypto Integration
 - **$TICKER price cards** — type `$BTC` `$ETH` etc. for live price embed (price, 24h%, volume, market cap)
 - **P2P price cache** — prices gossiped across the mesh, 1-minute TTL, no API key needed
-- **0x address scanner** — paste any 0x address, scans 7 EVM chains (ETH, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base)
-- **Multi-chain explorer links** — click to open Etherscan, BSCscan, Polygonscan etc.
+- **0x contract lookup** — paste any token contract address, auto-detects chain and shows full price card
+- **Multi-chain support** — scans Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base via CoinGecko
+- **DexTools integration** — direct links to DexTools pair explorer for any token
 - **60+ tokens supported** — all major coins + memecoins + DeFi tokens
 
 ### 💰 Crypto Price Bot
@@ -342,7 +343,7 @@ python3 -m http.server 8080
 
 ## Changelog
 
-### v1.2.2 — Sprint 2: Crypto Price Bot
+### v1.2.3 — Sprint 2: Crypto Price Bot
 
 **$TICKER Price Cards (P2P Cached)**
 - Type `$BTC`, `$ETH`, `$SOL` etc. in any message → detailed embed card appears below
@@ -352,12 +353,13 @@ python3 -m http.server 8080
 - No API key needed — uses CoinGecko free public API
 - Zero IP ban risk — distributed fetching across the mesh means no single IP gets rate-limited
 
-**0x Address Detection**
-- Paste any `0x` address (40 hex chars) → multi-chain explorer card appears
-- Scans 7 chains in parallel via public RPCs: Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base
-- Shows balance per chain where funds are found
-- Click any chain → opens block explorer for that address
-- Balances cached for 2 minutes
+**0x Token Contract Detection**
+- Paste any `0x` contract address (40 hex chars) → token price card appears (same style as $TICKER)
+- CoinGecko contract API searches across 7 chains: Ethereum, BSC, Polygon, Arbitrum, Optimism, Avalanche, Base
+- Shows full price card: name, symbol, price, 24h change, market cap, volume, platform badge
+- Links to CoinGecko + DexTools for deeper analysis
+- If token not found on CoinGecko, shows Etherscan + DexTools fallback links
+- Same P2P gossip cache — token data shared across the mesh
 
 **Architecture**
 ```
@@ -365,6 +367,10 @@ User types "$BTC" → check local cache (1 min TTL)
   → HIT: render card instantly
   → MISS: fetch from CoinGecko → render card → gossip to all peers
            peers receive → inject into their cache → no API call needed
+
+User pastes "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+  → check local cache → MISS → CoinGecko contract API (tries 7 chains)
+  → finds Tether (USDT) on Ethereum → render price card → gossip to mesh
 
 Result: 10 users type $BTC = 1 API call (not 10)
 ```

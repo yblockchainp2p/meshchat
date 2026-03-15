@@ -1830,15 +1830,15 @@ const TICKER_MAP = {
   'STX': 'blockstack', 'IMX': 'immutable-x', 'GALA': 'gala',
 };
 
-// Chain detection for 0x addresses
+// Chain explorers for address links (fallback when CoinGecko doesn't find the token)
 const CHAIN_EXPLORERS = {
-  'ethereum': { name: 'Ethereum', explorer: 'https://etherscan.io/address/', rpc: 'https://eth.llamarpc.com', symbol: 'ETH', icon: '⟠' },
-  'bsc': { name: 'BSC', explorer: 'https://bscscan.com/address/', rpc: 'https://bsc-dataseed.binance.org', symbol: 'BNB', icon: '🔶' },
-  'polygon': { name: 'Polygon', explorer: 'https://polygonscan.com/address/', rpc: 'https://polygon-rpc.com', symbol: 'POL', icon: '🟣' },
-  'arbitrum': { name: 'Arbitrum', explorer: 'https://arbiscan.io/address/', rpc: 'https://arb1.arbitrum.io/rpc', symbol: 'ETH', icon: '🔵' },
-  'optimism': { name: 'Optimism', explorer: 'https://optimistic.etherscan.io/address/', rpc: 'https://mainnet.optimism.io', symbol: 'ETH', icon: '🔴' },
-  'avalanche': { name: 'Avalanche', explorer: 'https://snowtrace.io/address/', rpc: 'https://api.avax.network/ext/bc/C/rpc', symbol: 'AVAX', icon: '🔺' },
-  'base': { name: 'Base', explorer: 'https://basescan.org/address/', rpc: 'https://mainnet.base.org', symbol: 'ETH', icon: '🔷' },
+  'ethereum': { name: 'Ethereum', explorer: 'https://etherscan.io/address/', icon: '⟠' },
+  'bsc': { name: 'BSC', explorer: 'https://bscscan.com/address/', icon: '🔶' },
+  'polygon': { name: 'Polygon', explorer: 'https://polygonscan.com/address/', icon: '🟣' },
+  'arbitrum': { name: 'Arbitrum', explorer: 'https://arbiscan.io/address/', icon: '🔵' },
+  'optimism': { name: 'Optimism', explorer: 'https://optimistic.etherscan.io/address/', icon: '🔴' },
+  'avalanche': { name: 'Avalanche', explorer: 'https://snowtrace.io/address/', icon: '🔺' },
+  'base': { name: 'Base', explorer: 'https://basescan.org/address/', icon: '🔷' },
 };
 
 class CryptoPrice {
@@ -1924,54 +1924,74 @@ class CryptoPrice {
     }
   }
 
-  // Fetch address balances across chains via public RPC
-  async fetchAddress(addr) {
+  // Fetch token info by contract address (0x...) via CoinGecko
+  // Tries multiple chains: ethereum, bsc, polygon, arbitrum, etc.
+  async fetchByContract(addr) {
     const cached = this.addrCache.get(addr);
-    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL * 2) return cached.balances;
+    if (cached && Date.now() - cached.ts < CRYPTO_CFG.CACHE_TTL) return cached.data;
 
-    const balances = [];
-    const chains = Object.entries(CHAIN_EXPLORERS);
+    if (this.pending.has('addr:' + addr)) return null;
+    this.pending.add('addr:' + addr);
 
-    // Fetch balances in parallel (max 3 at a time for speed)
-    const results = await Promise.allSettled(
-      chains.map(async ([chainId, chain]) => {
+    // CoinGecko platform IDs for contract lookup
+    const platforms = [
+      { id: 'ethereum', name: 'Ethereum', icon: '⟠' },
+      { id: 'binance-smart-chain', name: 'BSC', icon: '🔶' },
+      { id: 'polygon-pos', name: 'Polygon', icon: '🟣' },
+      { id: 'arbitrum-one', name: 'Arbitrum', icon: '🔵' },
+      { id: 'optimistic-ethereum', name: 'Optimism', icon: '🔴' },
+      { id: 'avalanche', name: 'Avalanche', icon: '🔺' },
+      { id: 'base', name: 'Base', icon: '🔷' },
+    ];
+
+    try {
+      // Try each platform until we get a hit
+      for (const platform of platforms) {
         try {
           const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 5000);
-          const resp = await fetch(chain.rpc, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getBalance', params: [addr, 'latest'], id: 1 }),
-            signal: ctrl.signal,
-          });
+          const timer = setTimeout(() => ctrl.abort(), CRYPTO_CFG.FETCH_TIMEOUT);
+          const url = `${CRYPTO_CFG.COINGECKO_BASE}/coins/${platform.id}/contract/${addr.toLowerCase()}`;
+          const resp = await fetch(url, { signal: ctrl.signal });
           clearTimeout(timer);
+
+          if (!resp.ok) continue; // Not found on this chain, try next
           const json = await resp.json();
-          const weiHex = json.result;
-          if (weiHex && weiHex !== '0x0') {
-            const wei = parseInt(weiHex, 16);
-            const balance = wei / 1e18;
-            if (balance > 0.0001) {
-              return { chainId, chain: chain.name, symbol: chain.symbol, balance, explorer: chain.explorer + addr, icon: chain.icon };
-            }
+
+          if (json.id) {
+            const data = {
+              ticker: (json.symbol || '???').toUpperCase(),
+              cgId: json.id,
+              name: json.name || 'Unknown Token',
+              symbol: (json.symbol || '???').toUpperCase(),
+              image: json.image?.small || '',
+              price: json.market_data?.current_price?.usd || 0,
+              change24h: json.market_data?.price_change_percentage_24h || 0,
+              marketCap: json.market_data?.market_cap?.usd || 0,
+              volume24h: json.market_data?.total_volume?.usd || 0,
+              high24h: json.market_data?.high_24h?.usd || 0,
+              low24h: json.market_data?.low_24h?.usd || 0,
+              ath: json.market_data?.ath?.usd || 0,
+              rank: json.market_cap_rank || 0,
+              contractAddress: addr,
+              platform: platform.name,
+              platformIcon: platform.icon,
+              fetchedAt: Date.now(),
+            };
+            this.addrCache.set(addr, { data, ts: Date.now() });
+            this._notify('addr:' + addr, data);
+            return data;
           }
-          return null;
-        } catch (_) { return null; }
-      })
-    );
-
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value) balances.push(r.value);
+        } catch (_) { continue; }
+      }
+      // Not found on any chain
+      this.addrCache.set(addr, { data: null, ts: Date.now() });
+      return null;
+    } catch (e) {
+      console.warn('CryptoPrice contract fetch error:', addr.slice(0, 10), e.message);
+      return null;
+    } finally {
+      this.pending.delete('addr:' + addr);
     }
-
-    // Always include explorer links even without balance
-    if (balances.length === 0) {
-      balances.push({ chainId: 'ethereum', chain: 'Ethereum', symbol: 'ETH', balance: 0, explorer: CHAIN_EXPLORERS.ethereum.explorer + addr, icon: '⟠' });
-      balances.push({ chainId: 'bsc', chain: 'BSC', symbol: 'BNB', balance: 0, explorer: CHAIN_EXPLORERS.bsc.explorer + addr, icon: '🔶' });
-      balances.push({ chainId: 'polygon', chain: 'Polygon', symbol: 'POL', balance: 0, explorer: CHAIN_EXPLORERS.polygon.explorer + addr, icon: '🟣' });
-    }
-
-    this.addrCache.set(addr, { balances, ts: Date.now() });
-    return balances;
   }
 
   // Detect tickers in text: $BTC $ETH etc.
